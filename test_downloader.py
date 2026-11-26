@@ -2,7 +2,9 @@ import pathlib
 import tempfile
 import unittest
 from unittest.mock import patch, MagicMock
+from fastapi.testclient import TestClient
 import downloader
+import main
 import config
 
 class DownloaderTests(unittest.TestCase):
@@ -117,5 +119,65 @@ class DownloaderTests(unittest.TestCase):
         self.assertEqual(downloader.get_download_status('stalled')['status'],'failed')
         self.assertIn('timed out',downloader.get_download_status('stalled')['error'])
         process.wait.assert_called_once()
+
+    def test_search_youtube_parses_flat_entries(self):
+        fake_ydl = MagicMock()
+        fake_ydl.__enter__.return_value = fake_ydl
+        fake_ydl.extract_info.return_value = {
+            'entries': [
+                {'id': 'abc123', 'title': 'Ocean Eyes', 'channel': 'Billie Eilish', 'duration': 200},
+                {'id': 'def456', 'title': 'Ocean Eyes Remix', 'uploader': 'Remix Channel', 'duration': 180},
+            ]
+        }
+        with patch('downloader.yt_dlp.YoutubeDL', return_value=fake_ydl):
+            results = downloader.search_youtube('Ocean Eyes', limit=5)
+        self.assertEqual(len(results), 2)
+        self.assertEqual(results[0]['url'], 'https://www.youtube.com/watch?v=abc123')
+        self.assertEqual(results[0]['channel'], 'Billie Eilish')
+        self.assertEqual(results[1]['channel'], 'Remix Channel')
+
+    def test_downloader_search_prefers_existing_server_song_over_youtube(self):
+        client = TestClient(main.app)
+        server_row = {
+            'id': 'song-local-1',
+            'title': 'Blinding Lights',
+            'artist': 'The Weeknd',
+            'album': 'After Hours',
+            'media_type': 'audio',
+            'duration': 200,
+            'owner_name': 'Home Hub',
+        }
+        with patch('main.database.get_songs', return_value=[server_row]), patch('main.downloader.search_youtube') as mock_yt:
+            res = client.get('/api/downloader/search', params={'q': 'Blinding Lights'})
+        self.assertEqual(res.status_code, 200)
+        payload = res.json()
+        self.assertTrue(payload['in_library'])
+        self.assertEqual(len(payload['local_matches']), 1)
+        self.assertEqual(payload['local_matches'][0]['id'], 'song-local-1')
+        self.assertEqual(payload['youtube_results'], [])
+        mock_yt.assert_not_called()
+
+    def test_downloader_search_falls_back_to_youtube_when_not_on_server(self):
+        client = TestClient(main.app)
+        yt_items = [
+            {
+                'id': 'yt-1',
+                'title': 'New Track Official Video',
+                'channel': 'ArtistVEVO',
+                'duration': 210.0,
+                'thumbnail': 'https://i.ytimg.com/vi/yt-1/hqdefault.jpg',
+                'url': 'https://www.youtube.com/watch?v=yt-1',
+                'source': 'youtube',
+            }
+        ]
+        with patch('main.database.get_songs', return_value=[]), patch('main.downloader.search_youtube', return_value=yt_items) as mock_yt:
+            res = client.get('/api/downloader/search', params={'q': 'New Track'})
+        self.assertEqual(res.status_code, 200)
+        payload = res.json()
+        self.assertFalse(payload['in_library'])
+        self.assertEqual(payload['local_matches'], [])
+        self.assertEqual(len(payload['youtube_results']), 1)
+        self.assertEqual(payload['youtube_results'][0]['id'], 'yt-1')
+        mock_yt.assert_called_once()
 
 if __name__=='__main__': unittest.main()

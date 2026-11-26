@@ -1190,6 +1190,80 @@ def reject_pending_upload(upload_id: str, request: Request):
     database.update_pending_upload_status(upload_id, "rejected")
     return {"message": f"Rejected '{item['filename']}'", "status": "rejected"}
 
+@app.get("/api/downloader/search")
+def search_for_download(
+    request: Request,
+    q: str = Query(..., min_length=1, description="Song/video title or URL to search"),
+    limit: int = Query(8, ge=1, le=20),
+    include_youtube: bool = Query(False),
+    client_id: Optional[str] = Query(None),
+):
+    clean_q = q.strip()
+    if not clean_q:
+        raise HTTPException(status_code=400, detail="Search query cannot be empty")
+
+    cid = get_request_client_id(request, client_id)
+
+    # 1. Check existing server library first (substring match, then multi-word token match)
+    local_rows = database.get_songs(query=clean_q, media_type="all", client_id=cid, limit=15)
+    if not local_rows and not clean_q.startswith(("http://", "https://")):
+        tokens = [t.lower() for t in clean_q.split() if t.strip()]
+        if len(tokens) > 1:
+            all_rows = database.get_songs(media_type="all", client_id=cid, limit=2000)
+            local_rows = [
+                row for row in all_rows
+                if all(
+                    tok in f"{row.get('title', '')} {row.get('artist', '')} {row.get('album', '')}".lower()
+                    for tok in tokens
+                )
+            ][:15]
+
+    local_matches = [
+        {
+            "id": r.get("id"),
+            "title": r.get("title") or "Unknown Title",
+            "artist": r.get("artist") or "Unknown Artist",
+            "album": r.get("album") or "",
+            "media_type": r.get("media_type") or "audio",
+            "duration": float(r.get("duration") or 0),
+            "resolution": r.get("resolution") or "",
+            "owner_name": r.get("owner_name") or "Server",
+            "stream_url": f"/api/stream/{r.get('id')}",
+            "source": "server",
+        }
+        for r in local_rows
+    ]
+
+    # When already present on the server, point directly to the server song/video and omit YouTube results.
+    if local_matches and not include_youtube:
+        return {
+            "query": clean_q,
+            "in_library": True,
+            "local_matches": local_matches,
+            "youtube_results": [],
+        }
+
+    try:
+        yt_results = downloader.search_youtube(clean_q, limit=limit)
+    except Exception as err:
+        if local_matches:
+            return {
+                "query": clean_q,
+                "in_library": True,
+                "local_matches": local_matches,
+                "youtube_results": [],
+                "youtube_error": str(err),
+            }
+        raise HTTPException(status_code=502, detail=f"YouTube search failed: {err}")
+
+    return {
+        "query": clean_q,
+        "in_library": bool(local_matches),
+        "local_matches": local_matches,
+        "youtube_results": yt_results,
+    }
+
+
 @app.post("/api/download")
 def enqueue_download(body: DownloadMediaRequest, request: Request):
     if not body.url.strip():

@@ -601,8 +601,11 @@
           </div>
           
           <div class="downloader-card">
-            <div class="input-group">
-              <input type="text" id="dl-url-input" placeholder="Paste YouTube, Instagram (Reel/Post), Spotify, or media link (or search by title)" autocomplete="off">
+            <div class="input-group dl-input-row">
+              <input type="text" id="dl-url-input" placeholder="Search song/video (checks server first, then YouTube) or paste a link..." autocomplete="off">
+              <button id="dl-search-btn" class="secondary-btn" type="button" title="Search your server first, then YouTube">
+                🔍 Search
+              </button>
             </div>
 
             <div class="downloader-options">
@@ -659,6 +662,9 @@
               💡 Supports <strong>YouTube, Instagram (Reels & Posts), Spotify, TikTok</strong> & 1,000+ sites. Use <strong>Cookies: Chrome/Edge</strong> for login-gated Instagram reels or age-restricted videos.
             </p>
           </div>
+
+          <!-- Downloader Search Results (Server-First + YouTube) -->
+          <div id="dl-search-results" class="dl-search-results hidden"></div>
 
           <!-- Active Downloads Queue -->
           <div class="downloads-section">

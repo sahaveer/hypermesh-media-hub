@@ -698,6 +698,124 @@ body {
   box-shadow: 0 0 0 2px var(--accent-glow);
 }
 
+.dl-input-row {
+  display: flex;
+  gap: 10px;
+  align-items: stretch;
+}
+
+.dl-input-row input {
+  flex: 1;
+}
+
+.dl-input-row button {
+  white-space: nowrap;
+  padding: 0 18px;
+  border-radius: var(--radius-md);
+  font-weight: 600;
+}
+
+.dl-search-results {
+  background: var(--bg-card);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-lg);
+  padding: 18px;
+  margin-bottom: 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.dl-search-results.hidden {
+  display: none;
+}
+
+.dl-search-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.dl-server-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  font-size: 0.75rem;
+  font-weight: 700;
+  background: rgba(16, 185, 129, 0.16);
+  color: #34d399;
+  border: 1px solid rgba(16, 185, 129, 0.35);
+}
+
+.dl-result-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 12px;
+  border-radius: var(--radius-md);
+  background: var(--bg-surface);
+  border: 1px solid var(--border-subtle);
+}
+
+.dl-result-left {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+  flex: 1;
+}
+
+.dl-result-thumb {
+  width: 84px;
+  height: 50px;
+  border-radius: 8px;
+  object-fit: cover;
+  background: #111827;
+  flex-shrink: 0;
+}
+
+.dl-result-meta {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.dl-result-title {
+  font-weight: 600;
+  color: var(--text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.dl-result-sub {
+  font-size: 0.78rem;
+  color: var(--text-muted);
+}
+
+.dl-result-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+@media (max-width: 640px) {
+  .dl-result-item {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .dl-result-actions {
+    justify-content: flex-end;
+  }
+}
+
 .downloader-options {
   display: flex;
   align-items: center;

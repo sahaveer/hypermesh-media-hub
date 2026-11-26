@@ -264,6 +264,8 @@ const audioVisualizerCanvas = document.getElementById('audio-visualizer-canvas')
 
 // Downloader Elements
 const dlUrlInput = document.getElementById('dl-url-input');
+const dlSearchBtn = document.getElementById('dl-search-btn');
+const dlSearchResultsEl = document.getElementById('dl-search-results');
 const dlQualitySelect = document.getElementById('dl-quality-select');
 const dlCookiesSelect = document.getElementById('dl-cookies-select');
 const startDownloadBtn = document.getElementById('start-download-btn');
@@ -1719,12 +1721,220 @@ function renderSharedFolders(folders) {
 }
 
 // --- Downloader Operations ---
+const autoPlayDownloadIds = new Set();
+
+function formatSecondsShort(sec) {
+  const s = Math.max(0, Math.floor(sec || 0));
+  if (!s) return '';
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const rem = s % 60;
+  if (h > 0) return `${h}:${String(m).padStart(2, '0')}:${String(rem).padStart(2, '0')}`;
+  return `${m}:${String(rem).padStart(2, '0')}`;
+}
+
+async function enqueueDownloaderUrl(url, { destinationOverride = null, autoPlay = false } = {}) {
+  const format = document.querySelector('input[name="dl-format"]:checked').value;
+  const quality = dlQualitySelect.value;
+  const destination = destinationOverride || document.querySelector('input[name="dl-destination"]:checked')?.value || 'server';
+  const cookies_browser = dlCookiesSelect ? (dlCookiesSelect.value || null) : null;
+
+  const res = await apiFetch('/api/download', {
+    method: 'POST',
+    signal: AbortSignal.timeout(15000),
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      url,
+      format,
+      quality,
+      destination,
+      cookies_browser,
+      target_playlist_id: dlPlaylistSelect ? (dlPlaylistSelect.value || null) : null,
+      client_id: clientId,
+      device_name: getDeviceType()
+    })
+  });
+
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.detail || 'The server could not start this download.');
+  if (autoPlay && data.task_id) {
+    autoPlayDownloadIds.add(data.task_id);
+  }
+  pollDownloads();
+  return data;
+}
+
+async function searchDownloader(query, includeYoutube = false) {
+  const clean = (query || '').trim();
+  if (!clean || !dlSearchResultsEl) return;
+
+  dlSearchResultsEl.classList.remove('hidden');
+  dlSearchResultsEl.innerHTML = '<p class="placeholder-text" style="margin:4px 0;">Searching server library & YouTube...</p>';
+  if (dlSearchBtn) {
+    dlSearchBtn.disabled = true;
+    dlSearchBtn.textContent = 'Searching...';
+  }
+
+  try {
+    const params = new URLSearchParams({
+      q: clean,
+      limit: '8',
+      include_youtube: includeYoutube ? 'true' : 'false',
+      client_id: clientId
+    });
+    const res = await apiFetch(`/api/downloader/search?${params.toString()}`, {
+      signal: AbortSignal.timeout(25000)
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || 'Search failed.');
+    renderDownloaderSearchResults(data);
+  } catch (err) {
+    dlSearchResultsEl.innerHTML = `<p style="color:#f87171; font-size:0.85rem; margin:0;">Search failed: ${escapeHtml(String(err.message || err))}</p>`;
+  } finally {
+    if (dlSearchBtn) {
+      dlSearchBtn.disabled = false;
+      dlSearchBtn.textContent = '🔍 Search';
+    }
+  }
+}
+
+function renderDownloaderSearchResults(data) {
+  if (!dlSearchResultsEl) return;
+  const localMatches = data.local_matches || [];
+  const ytResults = data.youtube_results || [];
+  dlSearchResultsEl.innerHTML = '';
+
+  const header = document.createElement('div');
+  header.className = 'dl-search-header';
+  if (localMatches.length > 0 && ytResults.length === 0) {
+    header.innerHTML = `
+      <span class="dl-server-badge">✅ Already on Your Server (${localMatches.length}) — Playing Locally (0 MB Internet)</span>
+      <div style="display:flex; gap:8px; align-items:center;">
+        <button type="button" class="secondary-btn dl-yt-anyway-btn" style="padding:4px 10px; font-size:0.75rem;">Search YouTube Anyway</button>
+        <button type="button" class="secondary-btn dl-close-search-btn" style="padding:4px 10px; font-size:0.75rem;">Close</button>
+      </div>
+    `;
+  } else {
+    header.innerHTML = `
+      <span style="font-size:0.85rem; font-weight:700; color:var(--text-primary);">Search Results (${ytResults.length} on YouTube)</span>
+      <button type="button" class="secondary-btn dl-close-search-btn" style="padding:4px 10px; font-size:0.75rem;">Close</button>
+    `;
+  }
+  dlSearchResultsEl.appendChild(header);
+
+  const closeBtn = header.querySelector('.dl-close-search-btn');
+  if (closeBtn) {
+    closeBtn.addEventListener('click', () => {
+      dlSearchResultsEl.classList.add('hidden');
+      dlSearchResultsEl.innerHTML = '';
+    });
+  }
+  const ytAnywayBtn = header.querySelector('.dl-yt-anyway-btn');
+  if (ytAnywayBtn) {
+    ytAnywayBtn.addEventListener('click', () => searchDownloader(data.query, true));
+  }
+
+  localMatches.forEach((item) => {
+    const row = document.createElement('div');
+    row.className = 'dl-result-item';
+    const dur = formatSecondsShort(item.duration);
+    const kindLabel = item.media_type === 'video' ? '🎬 Video' : '🎵 Audio';
+    row.innerHTML = `
+      <div class="dl-result-left">
+        <div class="dl-result-meta">
+          <div class="dl-result-title">${escapeHtml(item.title)}</div>
+          <div class="dl-result-sub">${kindLabel} • ${escapeHtml(item.artist || 'Server')}${dur ? ` • ${dur}` : ''} • Ready on Server</div>
+        </div>
+      </div>
+      <div class="dl-result-actions">
+        <button type="button" class="primary-btn dl-play-local-btn" style="padding:6px 14px; font-size:0.8rem;">▶️ Play from Server</button>
+      </div>
+    `;
+    row.querySelector('.dl-play-local-btn').addEventListener('click', () => playSongById(item.id));
+    dlSearchResultsEl.appendChild(row);
+  });
+
+  if (ytResults.length === 0 && localMatches.length === 0) {
+    const empty = document.createElement('p');
+    empty.className = 'placeholder-text';
+    empty.style.margin = '4px 0';
+    empty.textContent = 'No matching results found on your server or YouTube.';
+    dlSearchResultsEl.appendChild(empty);
+    return;
+  }
+
+  ytResults.forEach((yt) => {
+    const row = document.createElement('div');
+    row.className = 'dl-result-item';
+    const dur = formatSecondsShort(yt.duration);
+    row.innerHTML = `
+      <div class="dl-result-left">
+        ${yt.thumbnail ? `<img class="dl-result-thumb" src="${escapeHtml(yt.thumbnail)}" alt="">` : ''}
+        <div class="dl-result-meta">
+          <div class="dl-result-title">${escapeHtml(yt.title)}</div>
+          <div class="dl-result-sub">${escapeHtml(yt.channel || 'YouTube')}${dur ? ` • ${dur}` : ''}</div>
+        </div>
+      </div>
+      <div class="dl-result-actions">
+        <button type="button" class="primary-btn dl-yt-play-btn" style="padding:6px 12px; font-size:0.78rem;">▶️ Download &amp; Play</button>
+        <button type="button" class="secondary-btn dl-yt-save-btn" style="padding:6px 12px; font-size:0.78rem;">⬇️ Download</button>
+      </div>
+    `;
+    const playBtn = row.querySelector('.dl-yt-play-btn');
+    const saveBtn = row.querySelector('.dl-yt-save-btn');
+
+    playBtn.addEventListener('click', async () => {
+      playBtn.disabled = true;
+      playBtn.textContent = 'Downloading...';
+      try {
+        await enqueueDownloaderUrl(yt.url, { destinationOverride: 'server', autoPlay: true });
+        playBtn.textContent = 'Queued (Auto-Play)';
+      } catch (err) {
+        alert(`Download failed to start: ${err.message || err}`);
+        playBtn.disabled = false;
+        playBtn.textContent = '▶️ Download & Play';
+      }
+    });
+
+    saveBtn.addEventListener('click', async () => {
+      saveBtn.disabled = true;
+      saveBtn.textContent = 'Queued';
+      try {
+        await enqueueDownloaderUrl(yt.url);
+      } catch (err) {
+        alert(`Download failed to start: ${err.message || err}`);
+        saveBtn.disabled = false;
+        saveBtn.textContent = '⬇️ Download';
+      }
+    });
+
+    dlSearchResultsEl.appendChild(row);
+  });
+}
+
 if (dlUrlInput) {
   dlUrlInput.addEventListener('keydown', (e) => {
     if (e.key === 'Enter') {
       e.preventDefault();
-      startDownloadBtn.click();
+      const val = dlUrlInput.value.trim();
+      if (!val) return;
+      if (val.startsWith('http://') || val.startsWith('https://')) {
+        startDownloadBtn.click();
+      } else {
+        searchDownloader(val);
+      }
     }
+  });
+}
+
+if (dlSearchBtn) {
+  dlSearchBtn.addEventListener('click', () => {
+    const val = dlUrlInput ? dlUrlInput.value.trim() : '';
+    if (!val) {
+      alert('Enter a song or video name to search your server & YouTube');
+      return;
+    }
+    searchDownloader(val);
   });
 }
 
@@ -1735,35 +1945,11 @@ startDownloadBtn.addEventListener('click', async () => {
     return;
   }
 
-  const format = document.querySelector('input[name="dl-format"]:checked').value;
-  const quality = dlQualitySelect.value;
-  const destination = document.querySelector('input[name="dl-destination"]:checked')?.value || 'server';
-  const cookies_browser = dlCookiesSelect ? (dlCookiesSelect.value || null) : null;
-
   try {
     startDownloadBtn.disabled = true;
     startDownloadBtn.textContent = 'Starting...';
-
-    const res = await apiFetch('/api/download', {
-      method: 'POST',
-      signal: AbortSignal.timeout(15000),
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        url,
-        format,
-        quality,
-        destination,
-        cookies_browser,
-        target_playlist_id: dlPlaylistSelect ? (dlPlaylistSelect.value || null) : null,
-        client_id: clientId,
-        device_name: getDeviceType()
-      })
-    });
-
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.detail || 'The server could not start this download.');
+    await enqueueDownloaderUrl(url);
     dlUrlInput.value = '';
-    pollDownloads();
   } catch (err) {
     alert(`Download failed to start: ${err}`);
   } finally {
@@ -1806,6 +1992,10 @@ async function pollDownloads() {
       if (t.status === 'completed' && !lastKnownCompleted.has(t.id)) {
         lastKnownCompleted.add(t.id);
         hasNewCompletion = true;
+        if (autoPlayDownloadIds.has(t.id) && t.song_id) {
+          autoPlayDownloadIds.delete(t.id);
+          playSongById(t.song_id);
+        }
         // Auto-download to client device if destination was client
         if (t.destination === 'client' && t.owner_id === clientId && t.download_url) {
           const dlA = document.createElement('a');

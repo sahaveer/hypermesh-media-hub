@@ -13,7 +13,7 @@ import sys
 import subprocess
 import signal
 import importlib.util
-from typing import Dict, Any, Optional, Tuple
+from typing import Dict, Any, Optional, Tuple, List
 import yt_dlp
 
 # Detect FFmpeg: prioritize system ffmpeg (e.g. Linux /usr/bin/ffmpeg or Windows PATH)
@@ -627,6 +627,76 @@ def start_download(
     )
     thread.start()
     return task_id
+
+def search_youtube(query: str, limit: int = 8) -> List[Dict[str, Any]]:
+    """
+    Searches YouTube using yt-dlp (metadata only, no download) and returns relevant results.
+    """
+    clean = (query or "").strip()
+    if not clean:
+        return []
+
+    target_url, resolved_hint = _resolve_media_url(clean)
+    if resolved_hint:
+        target = f"ytsearch{limit}:{resolved_hint}"
+    elif target_url.startswith("ytsearch"):
+        # Replace ytsearch1: with ytsearch{limit}:
+        _, _, search_term = target_url.partition(":")
+        target = f"ytsearch{limit}:{search_term}"
+    else:
+        target = target_url
+
+    ydl_opts: Dict[str, Any] = {
+        "quiet": True,
+        "no_warnings": True,
+        "extract_flat": "in_playlist",
+        "skip_download": True,
+        "socket_timeout": 12,
+        "noplaylist": True,
+        "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    }
+    if NODE_PATH and os.path.exists(NODE_PATH):
+        ydl_opts["js_runtimes"] = {"node": {"path": NODE_PATH}}
+
+    results: List[Dict[str, Any]] = []
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(target, download=False)
+        if not info:
+            return []
+        raw_entries = info.get("entries") if "entries" in info else [info]
+        for entry in raw_entries or []:
+            if not entry:
+                continue
+            vid_id = str(entry.get("id") or "").strip()
+            watch_url = str(entry.get("webpage_url") or entry.get("url") or "").strip()
+            if watch_url and not watch_url.startswith(("http://", "https://")) and vid_id:
+                watch_url = f"https://www.youtube.com/watch?v={vid_id}"
+            elif not watch_url and vid_id:
+                watch_url = f"https://www.youtube.com/watch?v={vid_id}"
+            if not watch_url:
+                continue
+
+            thumbs = entry.get("thumbnails") or []
+            thumb = entry.get("thumbnail")
+            if not thumb and isinstance(thumbs, list) and thumbs:
+                thumb = thumbs[-1].get("url")
+            if not thumb and vid_id:
+                thumb = f"https://i.ytimg.com/vi/{vid_id}/hqdefault.jpg"
+
+            results.append({
+                "id": vid_id or watch_url,
+                "title": str(entry.get("title") or "Untitled Video").strip(),
+                "channel": str(entry.get("channel") or entry.get("uploader") or "YouTube").strip(),
+                "duration": float(entry.get("duration") or 0),
+                "thumbnail": thumb,
+                "url": watch_url,
+                "source": "youtube",
+            })
+            if len(results) >= limit:
+                break
+
+    return results
+
 
 def clear_downloads() -> None:
     """Removes completed, failed, or cancelled download tasks from the queue."""
