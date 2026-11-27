@@ -1768,6 +1768,26 @@ async function showPlaybackError(engine) {
       }
     };
     panel.appendChild(compatible);
+    if (engine === videoEngine && state.activeVideo && state.activeVideo.id) {
+      const hlsBtn = document.createElement('button');
+      hlsBtn.className = 'primary-btn';
+      hlsBtn.textContent = 'Stream Adaptive HLS (720p)';
+      hlsBtn.style.margin = '8px';
+      hlsBtn.onclick = async () => {
+        hlsBtn.disabled = true;
+        message.textContent = 'Starting segmented HLS stream (plays in ~2s)…';
+        try {
+          if (videoQualitySelect) videoQualitySelect.value = '720p';
+          await loadVideoWithQuality(state.activeVideo, '720p');
+          clearPlaybackNotice();
+        } catch (err) {
+          if (version !== playbackNoticeVersion) return;
+          message.textContent = err.message || 'Could not start HLS stream.';
+          hlsBtn.disabled = false;
+        }
+      };
+      panel.appendChild(hlsBtn);
+    }
     const vlc = document.createElement('a');
     vlc.className = 'secondary-btn';
     vlc.textContent = 'Open original in VLC';
@@ -1786,6 +1806,63 @@ videoEngine.addEventListener('error', () => showPlaybackError(videoEngine));
 audio.addEventListener('playing', () => { state.isPlaying = true; updatePlayIcons(true); clearPlaybackNotice(); });
 videoEngine.addEventListener('playing', clearPlaybackNotice);
 
+let activeHlsInstance = null;
+const videoQualitySelect = document.getElementById('video-quality-select');
+
+function destroyActiveHls() {
+  if (activeHlsInstance) {
+    try { activeHlsInstance.destroy(); } catch (_) {}
+    activeHlsInstance = null;
+  }
+}
+
+function ensureHlsJsLoaded() {
+  if (window.Hls) return Promise.resolve(window.Hls);
+  return new Promise((resolve, reject) => {
+    const script = document.createElement('script');
+    script.src = 'https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js';
+    script.onload = () => resolve(window.Hls);
+    script.onerror = () => reject(new Error('Could not load hls.js'));
+    document.head.appendChild(script);
+  });
+}
+
+async function loadVideoWithQuality(video, quality) {
+  destroyActiveHls();
+  const directUrl = video.isLocal ? video.url : (video.stream_url || `/api/stream/${video.id}`);
+  if (!quality || quality === 'direct' || video.isLocal) {
+    videoEngine.src = directUrl;
+    videoEngine.play().catch(e => console.warn('Video autoplay prevented:', e));
+    return;
+  }
+  const hlsUrl = `/api/hls/${encodeURIComponent(video.id)}/index.m3u8?quality=${encodeURIComponent(quality)}`;
+  if (videoEngine.canPlayType('application/vnd.apple.mpegurl')) {
+    videoEngine.src = hlsUrl;
+    videoEngine.play().catch(e => console.warn('Video autoplay prevented:', e));
+    return;
+  }
+  const HlsCtor = await ensureHlsJsLoaded();
+  if (HlsCtor && HlsCtor.isSupported()) {
+    activeHlsInstance = new HlsCtor({ lowLatencyMode: false });
+    activeHlsInstance.loadSource(hlsUrl);
+    activeHlsInstance.attachMedia(videoEngine);
+    activeHlsInstance.on(HlsCtor.Events.MANIFEST_PARSED, () => {
+      videoEngine.play().catch(e => console.warn('Video autoplay prevented:', e));
+    });
+  } else {
+    videoEngine.src = hlsUrl;
+    videoEngine.play().catch(e => console.warn('Video autoplay prevented:', e));
+  }
+}
+
+if (videoQualitySelect) {
+  videoQualitySelect.addEventListener('change', () => {
+    if (state.activeVideo) {
+      loadVideoWithQuality(state.activeVideo, videoQualitySelect.value).catch(err => console.warn(err));
+    }
+  });
+}
+
 function openVideoPlayer(video) {
   clearPlaybackNotice();
   pauseAudio();
@@ -1798,13 +1875,17 @@ function openVideoPlayer(video) {
       ? (e) => deleteMedia(video, video.title || 'video', e)
       : null;
   }
-  videoEngine.src = video.isLocal ? video.url : (video.stream_url || `/api/stream/${video.id}`);
+  if (videoQualitySelect) {
+    videoQualitySelect.value = 'direct';
+    videoQualitySelect.style.display = video.isLocal ? 'none' : '';
+  }
   videoModal.classList.remove('hidden');
-  videoEngine.play().catch(e => console.warn('Video autoplay prevented:', e));
+  loadVideoWithQuality(video, 'direct').catch(e => console.warn('Video play error:', e));
 }
 
 videoModalClose.addEventListener('click', () => {
   clearPlaybackNotice();
+  destroyActiveHls();
   videoEngine.pause();
   videoEngine.removeAttribute('src');
   videoEngine.load();

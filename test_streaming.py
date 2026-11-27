@@ -66,4 +66,31 @@ class StreamingTests(unittest.TestCase):
                 self.assertEqual(error.exception.status_code,422)
                 self.assertFalse(list((root/'cache'/'playback').glob('tmp*')))
 
+    def test_real_hls_segmented_stream(self):
+        import time as _time
+        ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+        with tempfile.TemporaryDirectory(dir=config.DATA_DIR) as directory:
+            root = pathlib.Path(directory)
+            video = root / 'sample.mp4'
+            subprocess.run(
+                [ffmpeg, '-v', 'error', '-f', 'lavfi', '-i', 'color=size=128x72:rate=10', '-f', 'lavfi', '-i', 'sine=frequency=440', '-t', '2', '-c:v', 'libx264', '-c:a', 'aac', str(video)],
+                check=True,
+            )
+            with patch.object(config, 'CACHE_DIR', root / 'cache'):
+                playlist, _ = streamer.get_hls_playlist(str(video), quality='480p', wait_seconds=15.0)
+                self.assertIn('#EXTM3U', playlist)
+                self.assertIn('seg_00000.ts', playlist)
+                seg0 = streamer.get_hls_segment_path(str(video), 'seg_00000.ts', quality='480p')
+                self.assertTrue(seg0.is_file())
+                self.assertGreater(seg0.stat().st_size, 0)
+                with self.assertRaises(HTTPException) as err:
+                    streamer.get_hls_segment_path(str(video), '../etc/passwd', quality='480p')
+                self.assertEqual(err.exception.status_code, 400)
+                for _ in range(40):
+                    status = streamer.get_hls_status(str(video), quality='480p')
+                    if status.get('complete'):
+                        break
+                    _time.sleep(0.1)
+                self.assertEqual(streamer.get_hls_status(str(video), quality='480p')['status'], 'ready')
+
 if __name__=='__main__': unittest.main()
