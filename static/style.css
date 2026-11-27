@@ -715,6 +715,13 @@ body {
   font-weight: 600;
 }
 
+.dl-action-buttons {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
 .dl-search-results {
   background: var(--bg-card);
   border: 1px solid var(--border-subtle);
@@ -886,7 +893,25 @@ body {
 
 .task-status-badge.completed { background: rgba(16, 185, 129, 0.2); color: #10b981; }
 .task-status-badge.downloading { background: rgba(99, 102, 241, 0.2); color: #6366f1; }
+.task-status-badge.processing { background: rgba(168, 85, 247, 0.2); color: #c084fc; }
+.task-status-badge.pending { background: rgba(148, 163, 184, 0.2); color: #cbd5e1; }
+.task-status-badge.paused { background: rgba(245, 158, 11, 0.2); color: #fbbf24; }
 .task-status-badge.failed { background: rgba(239, 68, 68, 0.2); color: #ef4444; }
+
+.dl-task-btn {
+  padding: 4px 10px;
+  font-size: 0.75rem;
+  border-radius: 6px;
+}
+
+.dl-task-btn.danger {
+  border-color: rgba(239, 68, 68, 0.45);
+  color: #f87171;
+}
+
+.dl-task-btn.danger:hover {
+  background: rgba(239, 68, 68, 0.16);
+}
 
 .download-progress-track {
   width: 100%;
@@ -2933,6 +2958,161 @@ input[type="range"]::-webkit-slider-thumb {
   padding: 2px 6px;
   border-radius: 4px;
   backdrop-filter: blur(4px);
+}
+
+/* Danger / Delete Buttons & In-App Confirmation Modal */
+.danger-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  background: linear-gradient(135deg, #ef4444, #dc2626);
+  color: #ffffff;
+  border: none;
+  border-radius: var(--radius-md);
+  padding: 9px 18px;
+  font-size: 0.88rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: transform 0.15s ease, filter 0.2s ease, opacity 0.2s ease;
+  box-shadow: 0 4px 14px rgba(239, 68, 68, 0.35);
+}
+
+.danger-btn:hover {
+  filter: brightness(1.08);
+}
+
+.danger-btn:active {
+  transform: scale(0.96);
+}
+
+.danger-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.video-modal-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.video-modal-delete-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  border-radius: var(--radius-full);
+  background: rgba(239, 68, 68, 0.16);
+  border: 1px solid rgba(239, 68, 68, 0.4);
+  color: #fca5a5;
+  font-size: 0.82rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.video-modal-delete-btn:hover {
+  background: #ef4444;
+  border-color: #ef4444;
+  color: #ffffff;
+}
+
+.confirm-modal-overlay {
+  z-index: 10050 !important;
+}
+
+.confirm-modal-card {
+  max-width: 420px;
+  border: 1px solid rgba(239, 68, 68, 0.3);
+  box-shadow: 0 20px 50px rgba(0, 0, 0, 0.65);
+}
+
+.confirm-modal-header {
+  display: flex;
+  align-items: flex-start;
+  gap: 14px;
+  margin-bottom: 14px;
+}
+
+.confirm-modal-icon {
+  width: 42px;
+  height: 42px;
+  border-radius: 12px;
+  background: rgba(239, 68, 68, 0.16);
+  color: #f87171;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  border: 1px solid rgba(239, 68, 68, 0.25);
+}
+
+.confirm-modal-body {
+  font-size: 0.9rem;
+  color: var(--text-secondary);
+  line-height: 1.5;
+  margin-bottom: 20px;
+  word-break: break-word;
+}
+
+.confirm-modal-detail {
+  margin-top: 8px;
+  padding: 8px 12px;
+  border-radius: var(--radius-sm);
+  background: rgba(239, 68, 68, 0.08);
+  border: 1px solid rgba(239, 68, 68, 0.2);
+  color: #fca5a5;
+  font-size: 0.8rem;
+}
+
+.confirm-modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
+.app-toast {
+  position: fixed;
+  bottom: 92px;
+  left: 50%;
+  transform: translateX(-50%) translateY(16px);
+  z-index: 10100;
+  background: rgba(20, 23, 34, 0.96);
+  color: var(--text-primary);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-full);
+  padding: 10px 18px;
+  font-size: 0.86rem;
+  font-weight: 600;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.55);
+  backdrop-filter: blur(12px);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.2s ease, transform 0.2s ease;
+  max-width: 90vw;
+  text-align: center;
+}
+
+.app-toast.show {
+  opacity: 1;
+  transform: translateX(-50%) translateY(0);
+}
+
+.app-toast.error {
+  border-color: rgba(239, 68, 68, 0.5);
+  color: #fca5a5;
+}
+
+.app-toast.success {
+  border-color: rgba(16, 185, 129, 0.5);
+  color: #6ee7b7;
+}
+
+@media (max-width: 768px) {
+  .app-toast {
+    bottom: calc(var(--player-height) + 72px + env(safe-area-inset-bottom));
+  }
 }
 
 

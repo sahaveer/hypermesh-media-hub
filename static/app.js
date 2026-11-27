@@ -26,6 +26,8 @@ const state = {
   queue: [],
   currentIndex: -1,
   currentTrack: null,
+  activeVideo: null,
+  activeDetailRefresh: null,
   isPlaying: false,
   isShuffle: false,
   repeatMode: 'off',
@@ -117,6 +119,7 @@ const audio = document.getElementById('audio-engine');
 const videoEngine = document.getElementById('video-engine');
 const videoModal = document.getElementById('video-player-modal');
 const videoModalTitle = document.getElementById('video-modal-title');
+const videoModalDeleteBtn = document.getElementById('video-modal-delete-btn');
 const videoModalClose = document.getElementById('video-modal-close');
 
 const songListEl = document.getElementById('song-list');
@@ -246,6 +249,7 @@ const batchActionBar = document.getElementById('batch-action-bar');
 const batchCountLabel = document.getElementById('batch-count-label');
 const batchAddPlaylistBtn = document.getElementById('batch-add-playlist-btn');
 const batchDownloadZipBtn = document.getElementById('batch-download-zip-btn');
+const batchDeleteBtn = document.getElementById('batch-delete-btn');
 const batchCancelBtn = document.getElementById('batch-cancel-btn');
 const dlPlaylistSelect = document.getElementById('dl-playlist-select');
 
@@ -257,6 +261,18 @@ const speedToggleBtn = document.getElementById('speed-toggle-btn');
 const fullAddPlBtn = document.getElementById('full-add-pl-btn');
 const fullDownloadBtn = document.getElementById('full-download-btn');
 const fullShareBtn = document.getElementById('full-share-btn');
+const fullDeleteBtn = document.getElementById('full-delete-btn');
+
+// Confirmation Modal & Toast Elements
+const confirmDeleteModal = document.getElementById('confirm-delete-modal');
+const confirmModalTitle = document.getElementById('confirm-modal-title');
+const confirmModalSubtitle = document.getElementById('confirm-modal-subtitle');
+const confirmModalMessage = document.getElementById('confirm-modal-message');
+const confirmModalDetail = document.getElementById('confirm-modal-detail');
+const confirmModalConfirm = document.getElementById('confirm-modal-confirm');
+const confirmModalCancel = document.getElementById('confirm-modal-cancel');
+const confirmModalClose = document.getElementById('confirm-modal-close');
+const appToast = document.getElementById('app-toast');
 const volumeMuteBtn = document.getElementById('volume-mute-btn');
 const volumeIcon = document.getElementById('volume-icon');
 const seekHoverTooltip = document.getElementById('seek-hover-tooltip');
@@ -901,6 +917,10 @@ async function fetchSettings() {
               if (!state.isAdmin) {
                 localStorage.removeItem('media_admin_token');
                 alert('Incorrect admin password. Please try again.');
+              } else {
+                fetchSongs(searchInput?.value?.trim() || '', sortSelect?.value || 'title');
+                fetchVideos(searchInput?.value?.trim() || '');
+                fetchFavorites();
               }
               await fetchSettings();
             }
@@ -1048,34 +1068,171 @@ function updatePlayerLoveButton(isFav) {
   }
 }
 
-async function deleteMedia(mediaId, mediaTitle, event) {
+let toastTimer = null;
+function showToast(message, type = 'info') {
+  if (!appToast) return;
+  appToast.textContent = message;
+  appToast.className = `app-toast show ${type}`;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => {
+    appToast.classList.remove('show');
+  }, 3200);
+}
+
+function showConfirmModal({
+  title = 'Delete Media?',
+  subtitle = 'This permanently removes the file from your server library.',
+  message = 'Are you sure you want to permanently delete this item?',
+  detail = '',
+  confirmText = 'Delete Permanently'
+} = {}) {
+  if (!confirmDeleteModal || !confirmModalConfirm || !confirmModalCancel) {
+    return Promise.resolve(window.confirm(message));
+  }
+  return new Promise((resolve) => {
+    confirmModalTitle.textContent = title;
+    if (confirmModalSubtitle) confirmModalSubtitle.textContent = subtitle;
+    if (confirmModalMessage) confirmModalMessage.textContent = message;
+    if (confirmModalDetail) {
+      if (detail) {
+        confirmModalDetail.textContent = detail;
+        confirmModalDetail.classList.remove('hidden');
+      } else {
+        confirmModalDetail.textContent = '';
+        confirmModalDetail.classList.add('hidden');
+      }
+    }
+    confirmModalConfirm.textContent = confirmText;
+    confirmModalConfirm.disabled = false;
+    confirmDeleteModal.classList.remove('hidden');
+
+    const cleanup = (result) => {
+      confirmDeleteModal.classList.add('hidden');
+      confirmModalConfirm.removeEventListener('click', onConfirm);
+      confirmModalCancel.removeEventListener('click', onCancel);
+      if (confirmModalClose) confirmModalClose.removeEventListener('click', onCancel);
+      confirmDeleteModal.removeEventListener('click', onBackdrop);
+      document.removeEventListener('keydown', onKeyDown, true);
+      resolve(result);
+    };
+
+    const onConfirm = () => cleanup(true);
+    const onCancel = () => cleanup(false);
+    const onBackdrop = (e) => {
+      if (e.target === confirmDeleteModal) cleanup(false);
+    };
+    const onKeyDown = (e) => {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        e.stopPropagation();
+        cleanup(false);
+      }
+    };
+
+    confirmModalConfirm.addEventListener('click', onConfirm);
+    confirmModalCancel.addEventListener('click', onCancel);
+    if (confirmModalClose) confirmModalClose.addEventListener('click', onCancel);
+    confirmDeleteModal.addEventListener('click', onBackdrop);
+    document.addEventListener('keydown', onKeyDown, true);
+    confirmModalCancel.focus();
+  });
+}
+
+function canDeleteMedia(item) {
+  return Boolean(item && !item.isLocal && (item.can_delete || item.is_owner || state.isAdmin));
+}
+
+function cleanupDeletedMediaFromPlayers(deletedIds) {
+  const idSet = new Set(deletedIds);
+  if (state.currentTrack && idSet.has(state.currentTrack.id)) {
+    pauseAudio();
+    audio.removeAttribute('src');
+    audio.load();
+    state.currentIndex = -1;
+    state.currentTrack = null;
+    if (miniTitle) miniTitle.textContent = 'No song playing';
+    if (miniArtist) miniArtist.textContent = 'Select a track to start';
+    if (miniCover) miniCover.src = '/icon.svg';
+    if (miniProgressFill) miniProgressFill.style.width = '0%';
+    fullPlayer?.classList.remove('open');
+  }
+  if (state.queue.length > 0) {
+    const activeId = state.currentTrack?.id;
+    state.queue = state.queue.filter(item => !idSet.has(item.id));
+    state.currentIndex = activeId ? state.queue.findIndex(item => item.id === activeId) : -1;
+    renderQueue();
+  }
+  if (state.activeVideo && idSet.has(state.activeVideo.id)) {
+    clearPlaybackNotice();
+    videoEngine.pause();
+    videoEngine.removeAttribute('src');
+    videoEngine.load();
+    videoModal?.classList.add('hidden');
+    state.activeVideo = null;
+  }
+}
+
+async function refreshLibraryAfterDelete() {
+  if (typeof modalAllSongsCache !== 'undefined') modalAllSongsCache = [];
+  const q = searchInput ? searchInput.value.trim() : '';
+  const sortBy = sortSelect ? sortSelect.value : 'title';
+  await Promise.allSettled([
+    fetchMyMedia(),
+    fetchSongs(q, sortBy),
+    fetchVideos(q),
+    fetchFavorites(),
+    fetchStatus()
+  ]);
+  if (state.currentView === 'detail' && typeof state.activeDetailRefresh === 'function') {
+    await state.activeDetailRefresh();
+  }
+}
+
+async function deleteMedia(mediaOrId, mediaTitle = 'media item', event = null) {
   if (event) {
     event.stopPropagation();
     event.preventDefault();
   }
-  if (!confirm(`Are you sure you want to permanently delete "${mediaTitle}" from the library?`)) return;
-  
+  const item = (mediaOrId && typeof mediaOrId === 'object') ? mediaOrId : null;
+  const mediaId = item ? item.id : mediaOrId;
+  const title = item ? (item.title || mediaTitle) : mediaTitle;
+  const isVideo = item?.media_type === 'video';
+  const isLiveShare = Boolean(item?.isLiveShare);
+  const typeLabel = isVideo ? 'Video' : 'Song';
+
+  const details = [];
+  if (item?.artist && item.artist !== 'Unknown Artist' && item.artist !== 'Video / Movie') details.push(item.artist);
+  if (item?.filesize) details.push(formatBytes(item.filesize));
+  if (isLiveShare) details.push('Live Peer Share');
+
+  const confirmed = await showConfirmModal({
+    title: `Delete ${typeLabel}?`,
+    subtitle: isLiveShare
+      ? 'This will stop broadcasting this live share to connected devices.'
+      : 'This will permanently delete the file from the server and remove it from playlists.',
+    message: `Are you sure you want to delete "${title}"?`,
+    detail: details.join(' • '),
+    confirmText: `Delete ${typeLabel}`
+  });
+  if (!confirmed) return;
+
+  cleanupDeletedMediaFromPlayers([mediaId]);
+
   try {
-    const res = await apiFetch(`/api/media/${mediaId}`, { method: 'DELETE' });
+    const endpoint = isLiveShare
+      ? `/api/peers/shares/${encodeURIComponent(mediaId)}`
+      : `/api/media/${encodeURIComponent(mediaId)}`;
+    const res = await apiFetch(endpoint, { method: 'DELETE' });
     if (res.ok) {
-      if (state.currentTrack && state.currentTrack.id === mediaId) {
-        pauseAudio();
-        state.currentIndex = -1;
-        state.currentTrack = null;
-      }
-      fetchMyMedia();
-      fetchSongs();
-      fetchVideos();
-      fetchFavorites();
-      fetchStatus();
-    } else if (res.status === 403) {
-      const err = await res.json();
-      alert(err.detail || "Permission denied. Only the owner who shared this file can delete it.");
+      showToast(`Deleted "${title}"`, 'success');
+      await refreshLibraryAfterDelete();
     } else {
-      alert("Could not delete file.");
+      let detailMsg = '';
+      try { detailMsg = (await res.json()).detail || ''; } catch (_) {}
+      showToast(detailMsg || (res.status === 403 ? 'Permission denied. Only the owner or host admin can delete this file.' : 'Could not delete file.'), 'error');
     }
   } catch (err) {
-    alert(`Error deleting media: ${err}`);
+    showToast(`Error deleting media: ${err}`, 'error');
   }
 }
 
@@ -1099,12 +1256,20 @@ function renderSongList(songs, container, isDetail = false) {
     row.dataset.songId = song.id;
 
     const isFav = !!song.is_favorite;
-    const isOwner = !!song.is_owner;
+    const canDelete = canDeleteMedia(song);
 
     if (song.isLiveShare) {
       const copyBtnHtml = song.copied_to_server 
         ? `<span class="badge-pill" style="background: rgba(16, 185, 129, 0.2); color:#34d399; font-size:0.7rem;">✓ Server Saved</span>`
         : `<button class="secondary-btn copy-share-to-server-btn" data-share-id="${song.id}" style="padding: 3px 8px; font-size: 0.7rem; border-radius: 6px;">📥 Copy to Server</button>`;
+      const liveDeleteHtml = canDelete
+        ? `<button class="icon-btn delete-media-btn" data-song-id="${song.id}" title="Delete live share">
+            <svg viewBox="0 0 24 24" width="16" height="16" stroke="currentColor" stroke-width="2" fill="none">
+              <polyline points="3 6 5 6 21 6"></polyline>
+              <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
+            </svg>
+          </button>`
+        : '';
 
       row.innerHTML = `
         <div class="song-index" style="color:#818cf8;">📡</div>
@@ -1128,6 +1293,7 @@ function renderSongList(songs, container, isDetail = false) {
             </svg>
           </a>
           ${copyBtnHtml}
+          ${liveDeleteHtml}
         </div>
       `;
       row.addEventListener('click', (e) => {
@@ -1140,6 +1306,10 @@ function renderSongList(songs, container, isDetail = false) {
           e.stopPropagation();
           await copyLiveShareToServer(song.id, copyBtn);
         });
+      }
+      const liveDeleteBtn = row.querySelector('.delete-media-btn');
+      if (liveDeleteBtn) {
+        liveDeleteBtn.addEventListener('click', (e) => deleteMedia(song, song.title || 'audio track', e));
       }
       container.appendChild(row);
       return;
@@ -1209,8 +1379,8 @@ function renderSongList(songs, container, isDetail = false) {
             </svg>
           </button>
         ` : ''}
-        ${isOwner ? `
-          <button class="icon-btn delete-media-btn" data-song-id="${song.id}" title="Delete file from server">
+        ${canDelete ? `
+          <button class="icon-btn delete-media-btn" data-song-id="${song.id}" title="Delete song from server">
             <svg viewBox="0 0 24 24" width="16" height="16" stroke="currentColor" stroke-width="2" fill="none">
               <polyline points="3 6 5 6 21 6"></polyline>
               <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
@@ -1268,7 +1438,7 @@ function renderSongList(songs, container, isDetail = false) {
 
     const deleteBtn = row.querySelector('.delete-media-btn');
     if (deleteBtn) {
-      deleteBtn.addEventListener('click', (e) => deleteMedia(song.id, song.title || 'audio track', e));
+      deleteBtn.addEventListener('click', (e) => deleteMedia(song, song.title || 'audio track', e));
     }
 
     const addBtn = row.querySelector('.add-to-pl-btn');
@@ -1298,11 +1468,20 @@ function renderVideos(videos, targetEl = videoGridEl) {
   videos.forEach(video => {
     const card = document.createElement('div');
     card.className = 'video-card';
+    const canDelete = canDeleteMedia(video);
 
     if (video.isLiveShare) {
       const copyBtnHtml = video.copied_to_server 
         ? `<span class="badge-pill" style="background: rgba(16, 185, 129, 0.2); color:#34d399;">✓ Saved to Server</span>`
         : `<button class="primary-btn copy-share-to-server-btn" data-share-id="${video.id}" style="padding: 4px 10px; font-size: 0.75rem; border-radius: 6px;">📥 Copy to Server</button>`;
+      const liveDeleteHtml = canDelete
+        ? `<button class="icon-btn delete-media-btn" data-video-id="${video.id}" title="Delete live share">
+            <svg viewBox="0 0 24 24" width="16" height="16" stroke="currentColor" stroke-width="2" fill="none">
+              <polyline points="3 6 5 6 21 6"></polyline>
+              <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
+            </svg>
+          </button>`
+        : '';
 
       card.innerHTML = `
         <div class="video-thumb-wrapper" style="border: 1px solid rgba(99, 102, 241, 0.4); box-shadow: 0 0 12px rgba(99, 102, 241, 0.15);">
@@ -1326,6 +1505,7 @@ function renderVideos(videos, targetEl = videoGridEl) {
           <div style="display:flex; align-items:center; gap:6px; flex-wrap:wrap; margin-top:6px;">
             <a href="${video.download_url}" class="secondary-btn" style="padding: 4px 8px; font-size: 0.72rem; text-decoration: none;" download>⬇️ Download</a>
             ${copyBtnHtml}
+            ${liveDeleteHtml}
           </div>
         </div>
       `;
@@ -1340,12 +1520,15 @@ function renderVideos(videos, targetEl = videoGridEl) {
           await copyLiveShareToServer(video.id, copyBtn);
         });
       }
+      const liveDeleteBtn = card.querySelector('.delete-media-btn');
+      if (liveDeleteBtn) {
+        liveDeleteBtn.addEventListener('click', (e) => deleteMedia(video, video.title || 'video', e));
+      }
       targetEl.appendChild(card);
       return;
     }
     const coverUrl = getCoverUrl(video);
     const isFav = !!video.is_favorite;
-    const isOwner = !!video.is_owner;
     const ownerBadge = (video.owner_name && video.owner_name !== 'Host') 
       ? ` • <span style="color: #a5b4fc;">Shared by ${escapeHtml(video.owner_name)}</span>` 
       : '';
@@ -1403,8 +1586,8 @@ function renderVideos(videos, targetEl = videoGridEl) {
               <line x1="12" y1="15" x2="12" y2="3"></line>
             </svg>
           </a>
-          ${isOwner ? `
-            <button class="icon-btn delete-media-btn" data-video-id="${video.id}" title="Delete file from server">
+          ${canDelete ? `
+            <button class="icon-btn delete-media-btn" data-video-id="${video.id}" title="Delete video from server">
               <svg viewBox="0 0 24 24" width="16" height="16" stroke="currentColor" stroke-width="2" fill="none">
                 <polyline points="3 6 5 6 21 6"></polyline>
                 <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
@@ -1434,7 +1617,7 @@ function renderVideos(videos, targetEl = videoGridEl) {
 
     const deleteBtn = card.querySelector('.delete-media-btn');
     if (deleteBtn) {
-      deleteBtn.addEventListener('click', (e) => deleteMedia(video.id, video.title || 'video', e));
+      deleteBtn.addEventListener('click', (e) => deleteMedia(video, video.title || 'video', e));
     }
 
     targetEl.appendChild(card);
@@ -1572,7 +1755,15 @@ videoEngine.addEventListener('playing', clearPlaybackNotice);
 function openVideoPlayer(video) {
   clearPlaybackNotice();
   pauseAudio();
+  state.activeVideo = video;
   videoModalTitle.textContent = video.title || 'Playing Video';
+  if (videoModalDeleteBtn) {
+    const canDelete = canDeleteMedia(video);
+    videoModalDeleteBtn.classList.toggle('hidden', !canDelete);
+    videoModalDeleteBtn.onclick = canDelete
+      ? (e) => deleteMedia(video, video.title || 'video', e)
+      : null;
+  }
   videoEngine.src = video.isLocal ? video.url : (video.stream_url || `/api/stream/${video.id}`);
   videoModal.classList.remove('hidden');
   videoEngine.play().catch(e => console.warn('Video autoplay prevented:', e));
@@ -1581,8 +1772,10 @@ function openVideoPlayer(video) {
 videoModalClose.addEventListener('click', () => {
   clearPlaybackNotice();
   videoEngine.pause();
-  videoEngine.src = '';
+  videoEngine.removeAttribute('src');
+  videoEngine.load();
   videoModal.classList.add('hidden');
+  state.activeVideo = null;
 });
 
 function renderPeers(peers, clients = []) {
@@ -1722,6 +1915,19 @@ function renderSharedFolders(folders) {
 
 // --- Downloader Operations ---
 const autoPlayDownloadIds = new Set();
+
+function isMediaUrl(raw) {
+  const clean = (raw || '').trim();
+  if (!clean || /\s/.test(clean)) return false;
+  if (/^(https?:\/\/|spotify:)/i.test(clean)) return true;
+  return /^(?:www\.)?(?:youtube\.com|youtu\.be|music\.youtube\.com|open\.spotify\.com|instagram\.com|tiktok\.com|vt\.tiktok\.com|vm\.tiktok\.com|soundcloud\.com|vimeo\.com|x\.com|twitter\.com|facebook\.com|fb\.watch)\/\S+/i.test(clean);
+}
+
+function normalizeMediaUrl(raw) {
+  const clean = (raw || '').trim();
+  if (/^(https?:\/\/|spotify:)/i.test(clean)) return clean;
+  return `https://${clean}`;
+}
 
 function formatSecondsShort(sec) {
   const s = Math.max(0, Math.floor(sec || 0));
@@ -1918,7 +2124,7 @@ if (dlUrlInput) {
       e.preventDefault();
       const val = dlUrlInput.value.trim();
       if (!val) return;
-      if (val.startsWith('http://') || val.startsWith('https://')) {
+      if (isMediaUrl(val)) {
         startDownloadBtn.click();
       } else {
         searchDownloader(val);
@@ -1939,12 +2145,19 @@ if (dlSearchBtn) {
 }
 
 startDownloadBtn.addEventListener('click', async () => {
-  const url = dlUrlInput.value.trim();
-  if (!url) {
+  const rawInput = dlUrlInput.value.trim();
+  if (!rawInput) {
     alert('Please paste a YouTube, Instagram, Spotify, or media link, or enter a song name to search');
     return;
   }
 
+  // Plain words/sentences should search first instead of blindly downloading the #1 hit
+  if (!isMediaUrl(rawInput)) {
+    searchDownloader(rawInput);
+    return;
+  }
+
+  const url = normalizeMediaUrl(rawInput);
   try {
     startDownloadBtn.disabled = true;
     startDownloadBtn.textContent = 'Starting...';
@@ -2065,17 +2278,26 @@ function renderDownloads(tasks) {
     const isDone = task.status === 'completed';
     const isClient = task.destination === 'client';
     const isFailed = task.status === 'failed';
+    const isPaused = task.status === 'paused';
     const isDownloading = task.status === 'downloading';
+    const isProcessing = task.status === 'processing';
+    const isActive = isDownloading || isProcessing || task.status === 'pending';
 
     let speedText = '';
     if (isDownloading && task.speed) {
       speedText = ` • ${formatBytes(task.speed)}/s`;
       if (task.eta) speedText += ` (ETA ${task.eta}s)`;
+    } else if (isPaused) {
+      speedText = ` • Paused at ${Math.round(task.progress || 0)}%`;
+    } else if (isProcessing) {
+      speedText = ' • Processing media...';
     }
+
+    const barColor = isFailed ? '#ef4444' : (isPaused ? '#f59e0b' : '');
 
     item.innerHTML = `
       <div class="download-task-header">
-        <div style="display:flex; flex-direction:column; gap:3px; max-width:68%; overflow:hidden;">
+        <div style="display:flex; flex-direction:column; gap:3px; max-width:60%; overflow:hidden;">
           <span class="task-title" style="white-space:nowrap; overflow:hidden; text-overflow:ellipsis;" title="${escapeHtml(task.title || task.url)}">
             ${escapeHtml(task.title || task.url)}
           </span>
@@ -2089,31 +2311,107 @@ function renderDownloads(tasks) {
             </span>
           `}
         </div>
-        <div style="display:flex; align-items:center; gap:8px;">
+        <div style="display:flex; align-items:center; gap:6px; flex-wrap:wrap; justify-content:flex-end;">
+          ${isActive ? `
+            <button type="button" class="secondary-btn dl-task-btn pause-dl-btn" title="Pause download">
+              ⏸ Pause
+            </button>
+          ` : ''}
+          ${isPaused ? `
+            <button type="button" class="primary-btn dl-task-btn resume-dl-btn" title="Resume download">
+              ▶️ Resume
+            </button>
+          ` : ''}
           ${isFailed ? `
-            <button class="secondary-btn retry-dl-btn" style="padding: 4px 10px; font-size: 0.75rem; border-radius: 6px;">
+            <button type="button" class="secondary-btn dl-task-btn retry-dl-btn">
               🔄 Retry
             </button>
           ` : ''}
           ${isDone && isClient && task.download_url ? `
-            <a href="${task.download_url}" class="primary-btn" style="padding: 4px 10px; font-size: 0.75rem; border-radius: 6px; text-decoration: none;" download>
+            <a href="${task.download_url}" class="primary-btn dl-task-btn" style="text-decoration: none;" download>
               💾 Save File
             </a>
             <a href="vlc://${window.location.origin}${task.download_url}" class="vlc-play-btn" style="padding: 4px 10px; font-size: 0.75rem;" target="_blank">📺 VLC</a>
           ` : ''}
           ${isDone && !isClient && task.song_id ? `
-            <button class="primary-btn play-dl-btn" style="padding: 4px 10px; font-size: 0.75rem; border-radius: 6px;">
+            <button type="button" class="primary-btn dl-task-btn play-dl-btn">
               ▶️ Play
             </button>
             <a href="vlc://${window.location.origin}/api/stream/${task.song_id}" class="vlc-play-btn" style="padding: 4px 10px; font-size: 0.75rem;" target="_blank">📺 VLC</a>
           ` : ''}
+          <button type="button" class="secondary-btn dl-task-btn danger delete-dl-btn" title="Delete download task and clean up partial files">
+            🗑️ Delete
+          </button>
           <span class="task-status-badge ${task.status}">${task.status}</span>
         </div>
       </div>
       <div class="download-progress-track">
-        <div class="download-progress-bar" style="width: ${isFailed ? 100 : (task.progress || (isDone ? 100 : 0))}%; background: ${isFailed ? '#ef4444' : ''}"></div>
+        <div class="download-progress-bar" style="width: ${isFailed ? 100 : (task.progress || (isDone ? 100 : 0))}%; background: ${barColor}"></div>
       </div>
     `;
+
+    const pauseBtn = item.querySelector('.pause-dl-btn');
+    if (pauseBtn) {
+      pauseBtn.addEventListener('click', async (e) => {
+        e.stopPropagation();
+        pauseBtn.disabled = true;
+        pauseBtn.textContent = 'Pausing...';
+        try {
+          const res = await apiFetch(`/api/downloads/${encodeURIComponent(task.id)}/pause`, { method: 'POST' });
+          if (!res.ok) {
+            const err = await res.json().catch(() => ({}));
+            throw new Error(err.detail || 'Could not pause download.');
+          }
+          pollDownloads();
+        } catch (err) {
+          alert(`Pause failed: ${err.message || err}`);
+          pauseBtn.disabled = false;
+          pauseBtn.textContent = '⏸ Pause';
+        }
+      });
+    }
+
+    const resumeBtn = item.querySelector('.resume-dl-btn');
+    if (resumeBtn) {
+      resumeBtn.addEventListener('click', async (e) => {
+        e.stopPropagation();
+        resumeBtn.disabled = true;
+        resumeBtn.textContent = 'Resuming...';
+        try {
+          const res = await apiFetch(`/api/downloads/${encodeURIComponent(task.id)}/resume`, { method: 'POST' });
+          if (!res.ok) {
+            const err = await res.json().catch(() => ({}));
+            throw new Error(err.detail || 'Could not resume download.');
+          }
+          pollDownloads();
+        } catch (err) {
+          alert(`Resume failed: ${err.message || err}`);
+          resumeBtn.disabled = false;
+          resumeBtn.textContent = '▶️ Resume';
+        }
+      });
+    }
+
+    const deleteBtn = item.querySelector('.delete-dl-btn');
+    if (deleteBtn) {
+      deleteBtn.addEventListener('click', async (e) => {
+        e.stopPropagation();
+        deleteBtn.disabled = true;
+        deleteBtn.textContent = 'Deleting...';
+        try {
+          const res = await apiFetch(`/api/downloads/${encodeURIComponent(task.id)}`, { method: 'DELETE' });
+          if (!res.ok && res.status !== 404) {
+            const err = await res.json().catch(() => ({}));
+            throw new Error(err.detail || 'Could not delete download.');
+          }
+          pollDownloads();
+        } catch (err) {
+          alert(`Delete failed: ${err.message || err}`);
+          deleteBtn.disabled = false;
+          deleteBtn.textContent = '🗑️ Delete';
+        }
+      });
+    }
 
     if (isDone && !isClient && task.song_id) {
       const playBtn = item.querySelector('.play-dl-btn');
@@ -2513,6 +2811,7 @@ function playShuffledList(songs) {
 async function openArtistDetail(artistName) {
   try {
     state.currentPlaylist = null;
+    state.activeDetailRefresh = () => openArtistDetail(artistName);
     if (detailAddSongsBtn) detailAddSongsBtn.classList.add('hidden');
     if (detailDeleteBtn) detailDeleteBtn.classList.add('hidden');
 
@@ -2530,7 +2829,7 @@ async function openArtistDetail(artistName) {
     detailShareBtn.onclick = () => {
       const shareUrl = `${window.location.origin}/#artist-${encodeURIComponent(artistName)}`;
       navigator.clipboard.writeText(shareUrl);
-      alert(`Copied link for artist "${artistName}"!`);
+      showToast(`Copied link for artist "${artistName}"!`, 'success');
     };
 
     renderSongList(songs, detailSongList, true);
@@ -2543,6 +2842,7 @@ async function openArtistDetail(artistName) {
 async function openAlbumDetail(album) {
   try {
     state.currentPlaylist = null;
+    state.activeDetailRefresh = () => openAlbumDetail(album);
     if (detailAddSongsBtn) detailAddSongsBtn.classList.add('hidden');
     if (detailDeleteBtn) detailDeleteBtn.classList.add('hidden');
 
@@ -2560,7 +2860,7 @@ async function openAlbumDetail(album) {
     detailShareBtn.onclick = () => {
       const shareUrl = `${window.location.origin}/#album-${encodeURIComponent(album.album)}`;
       navigator.clipboard.writeText(shareUrl);
-      alert(`Copied link for album "${album.album}"!`);
+      showToast(`Copied link for album "${album.album}"!`, 'success');
     };
 
     renderSongList(songs, detailSongList, true);
@@ -2573,6 +2873,7 @@ async function openAlbumDetail(album) {
 async function openPlaylistDetail(playlist) {
   try {
     state.currentPlaylist = playlist;
+    state.activeDetailRefresh = () => openPlaylistDetail(playlist);
     const res = await apiFetch(`/api/playlists/${playlist.id}/songs`);
     const data = await res.json();
     const songs = data.songs || [];
@@ -2630,16 +2931,24 @@ async function openPlaylistDetail(playlist) {
       if (detailDeleteBtn) {
         detailDeleteBtn.classList.remove('hidden');
         detailDeleteBtn.onclick = async () => {
-          if (confirm(`Delete playlist "${playlist.name}"? (Tracks in your library will be preserved)`)) {
+          const confirmed = await showConfirmModal({
+            title: 'Delete Playlist?',
+            subtitle: 'Tracks in your media library will be preserved.',
+            message: `Are you sure you want to delete the playlist "${playlist.name}"?`,
+            confirmText: 'Delete Playlist'
+          });
+          if (confirmed) {
             try {
               const dres = await apiFetch(`/api/playlists/${playlist.id}`, { method: 'DELETE' });
               if (dres.ok) {
                 state.currentPlaylist = null;
+                state.activeDetailRefresh = null;
+                showToast(`Deleted playlist "${playlist.name}"`, 'success');
                 await fetchPlaylists();
                 switchView('playlists');
               }
             } catch (e) {
-              alert('Failed to delete playlist: ' + e);
+              showToast('Failed to delete playlist: ' + e, 'error');
             }
           }
         };
@@ -2668,6 +2977,7 @@ async function openPlaylistDetail(playlist) {
 async function openGenreDetail(genreName) {
   try {
     state.currentPlaylist = null;
+    state.activeDetailRefresh = () => openGenreDetail(genreName);
     if (detailAddSongsBtn) detailAddSongsBtn.classList.add('hidden');
     if (detailDeleteBtn) detailDeleteBtn.classList.add('hidden');
 
@@ -2686,7 +2996,7 @@ async function openGenreDetail(genreName) {
     detailShareBtn.onclick = () => {
       const shareUrl = `${window.location.origin}/#genre-${encodeURIComponent(genreName)}`;
       navigator.clipboard.writeText(shareUrl);
-      alert(`Copied link for genre "${genreName}"!`);
+      showToast(`Copied link for genre "${genreName}"!`, 'success');
     };
 
     renderSongList(songs, detailSongList, true);
@@ -2699,6 +3009,7 @@ async function openGenreDetail(genreName) {
 async function openLanguageDetail(languageName) {
   try {
     state.currentPlaylist = null;
+    state.activeDetailRefresh = () => openLanguageDetail(languageName);
     if (detailAddSongsBtn) detailAddSongsBtn.classList.add('hidden');
     if (detailDeleteBtn) detailDeleteBtn.classList.add('hidden');
 
@@ -2717,7 +3028,7 @@ async function openLanguageDetail(languageName) {
     detailShareBtn.onclick = () => {
       const shareUrl = `${window.location.origin}/#lang-${encodeURIComponent(languageName)}`;
       navigator.clipboard.writeText(shareUrl);
-      alert(`Copied link for language "${languageName}"!`);
+      showToast(`Copied link for language "${languageName}"!`, 'success');
     };
 
     renderSongList(songs, detailSongList, true);
@@ -2730,6 +3041,7 @@ async function openLanguageDetail(languageName) {
 async function openDecadeDetail(decade) {
   try {
     state.currentPlaylist = null;
+    state.activeDetailRefresh = () => openDecadeDetail(decade);
     if (detailAddSongsBtn) detailAddSongsBtn.classList.add('hidden');
     if (detailDeleteBtn) detailDeleteBtn.classList.add('hidden');
 
@@ -2748,7 +3060,7 @@ async function openDecadeDetail(decade) {
     detailShareBtn.onclick = () => {
       const shareUrl = `${window.location.origin}/#era-${encodeURIComponent(decade)}`;
       navigator.clipboard.writeText(shareUrl);
-      alert(`Copied link for era "${decade}"!`);
+      showToast(`Copied link for era "${decade}"!`, 'success');
     };
 
     renderSongList(songs, detailSongList, true);
@@ -2761,6 +3073,7 @@ async function openDecadeDetail(decade) {
 async function openYearDetail(year) {
   try {
     state.currentPlaylist = null;
+    state.activeDetailRefresh = () => openYearDetail(year);
     if (detailAddSongsBtn) detailAddSongsBtn.classList.add('hidden');
     if (detailDeleteBtn) detailDeleteBtn.classList.add('hidden');
 
@@ -2779,7 +3092,7 @@ async function openYearDetail(year) {
     detailShareBtn.onclick = () => {
       const shareUrl = `${window.location.origin}/#year-${year}`;
       navigator.clipboard.writeText(shareUrl);
-      alert(`Copied link for year ${year}!`);
+      showToast(`Copied link for year ${year}!`, 'success');
     };
 
     renderSongList(songs, detailSongList, true);
@@ -3226,9 +3539,16 @@ function loadTrack(index, autoPlay = true) {
         }).catch(() => {});
       } else {
         navigator.clipboard.writeText(shareUrl);
-        alert('Track link copied to clipboard!');
+        showToast('Track link copied to clipboard!', 'success');
       }
     };
+  }
+  if (fullDeleteBtn) {
+    const canDelete = canDeleteMedia(song);
+    fullDeleteBtn.classList.toggle('hidden', !canDelete);
+    fullDeleteBtn.onclick = canDelete
+      ? (e) => deleteMedia(song, song.title || 'audio track', e)
+      : null;
   }
 
   updatePlayerLoveButton(song.is_favorite);
@@ -4735,11 +5055,64 @@ if (batchDownloadZipBtn) {
 if (batchAddPlaylistBtn) {
   batchAddPlaylistBtn.addEventListener('click', async () => {
     if (state.selectedSongIds.size === 0) {
-      alert('Please select at least one song first.');
+      showToast('Please select at least one song first.', 'error');
       return;
     }
     await openBatchAddToPlaylistPicker(Array.from(state.selectedSongIds));
   });
+}
+
+async function batchDeleteSelectedMedia() {
+  if (state.selectedSongIds.size === 0) {
+    showToast('Please select at least one song to delete.', 'error');
+    return;
+  }
+  const selectedIds = Array.from(state.selectedSongIds);
+  const selectedItems = selectedIds
+    .map(id => state.filteredSongs.find(s => s.id === id) || state.allSongs.find(s => s.id === id))
+    .filter(Boolean);
+  const deletableItems = selectedItems.filter(item => canDeleteMedia(item));
+  const deletableIds = deletableItems.length > 0 ? deletableItems.map(i => i.id) : selectedIds;
+
+  if (selectedItems.length > 0 && deletableItems.length === 0) {
+    showToast('Permission denied. Only files you uploaded or host files (as admin) can be deleted.', 'error');
+    return;
+  }
+
+  const confirmed = await showConfirmModal({
+    title: `Delete ${deletableIds.length} Selected Song${deletableIds.length === 1 ? '' : 's'}?`,
+    subtitle: 'This permanently deletes the selected files from the server and removes them from playlists.',
+    message: `Are you sure you want to permanently delete ${deletableIds.length} selected track${deletableIds.length === 1 ? '' : 's'}?`,
+    detail: deletableItems.slice(0, 3).map(i => i.title || 'Track').join(', ') + (deletableItems.length > 3 ? ` + ${deletableItems.length - 3} more` : ''),
+    confirmText: `Delete ${deletableIds.length} Track${deletableIds.length === 1 ? '' : 's'}`
+  });
+  if (!confirmed) return;
+
+  cleanupDeletedMediaFromPlayers(deletableIds);
+
+  try {
+    const res = await apiFetch('/api/media/batch-delete', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ media_ids: deletableIds })
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok) {
+      state.isBatchMode = false;
+      state.selectedSongIds.clear();
+      updateBatchUI();
+      showToast(data.message || `Deleted ${deletableIds.length} track(s)`, 'success');
+      await refreshLibraryAfterDelete();
+    } else {
+      showToast(data.detail || 'Could not delete selected tracks.', 'error');
+    }
+  } catch (err) {
+    showToast(`Error deleting tracks: ${err}`, 'error');
+  }
+}
+
+if (batchDeleteBtn) {
+  batchDeleteBtn.addEventListener('click', batchDeleteSelectedMedia);
 }
 
 async function downloadSongsBatchZip(songIds, filename = 'tracks.zip') {
@@ -6047,19 +6420,26 @@ if (lightboxDeleteBtn) {
   lightboxDeleteBtn.addEventListener('click', async () => {
     if (activePhotoIndex < 0 || !state.photos[activePhotoIndex]) return;
     const photo = state.photos[activePhotoIndex];
-    if (confirm(`Delete photo "${photo.title}"?`)) {
+    const confirmed = await showConfirmModal({
+      title: 'Delete Photo?',
+      subtitle: 'This permanently removes the photo from the server.',
+      message: `Are you sure you want to delete "${photo.title || 'Photo'}"?`,
+      confirmText: 'Delete Photo'
+    });
+    if (confirmed) {
       try {
         const res = await apiFetch(`/api/photo/${photo.id}`, { method: 'DELETE' });
         if (res.ok) {
           closePhotoLightbox();
+          showToast(`Deleted "${photo.title || 'Photo'}"`, 'success');
           fetchPhotos();
           fetchStatus();
         } else {
           const err = await res.json();
-          alert(err.detail || 'Could not delete photo');
+          showToast(err.detail || 'Could not delete photo', 'error');
         }
       } catch (e) {
-        alert(`Error: ${e}`);
+        showToast(`Error: ${e}`, 'error');
       }
     }
   });

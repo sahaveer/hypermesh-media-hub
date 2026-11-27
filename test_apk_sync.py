@@ -30,12 +30,12 @@ class ApkSyncTests(unittest.TestCase):
     def test_load_dotenv_file_sets_missing_env_vars(self):
         with tempfile.TemporaryDirectory() as tmp:
             env_file = pathlib.Path(tmp) / ".env"
-            env_file.write_text('# comment\nAPK_GITHUB_TOKEN="ghp_from_dotenv"\nexport TEST_FLAG=yes\n', encoding="utf-8")
+            env_file.write_text('# comment\nAPK_GITHUB_TOKEN="test_token_from_dotenv"\nexport TEST_FLAG=yes\n', encoding="utf-8")
             with patch.dict(os.environ, {}, clear=False):
                 os.environ.pop("APK_GITHUB_TOKEN", None)
                 os.environ.pop("TEST_FLAG", None)
                 config._load_dotenv_file(env_file)
-                self.assertEqual(os.environ.get("APK_GITHUB_TOKEN"), "ghp_from_dotenv")
+                self.assertEqual(os.environ.get("APK_GITHUB_TOKEN"), "test_token_from_dotenv")
                 self.assertEqual(os.environ.get("TEST_FLAG"), "yes")
 
     def test_parse_release_version(self):
@@ -47,7 +47,7 @@ class ApkSyncTests(unittest.TestCase):
         cleaned = main.public_settings({
             "admin_token": "secret-admin",
             "global_tunnel_token": "secret-tunnel",
-            "apk_github_token": "ghp_secret_token",
+            "apk_github_token": "test_secret_token",
             "apk_github_repo": "sahaveer/hypermesh-mobile-app",
         })
         self.assertNotIn("apk_github_token", cleaned)
@@ -89,7 +89,7 @@ class ApkSyncTests(unittest.TestCase):
                 client = TestClient(main.app)
                 res = client.post(
                     "/api/app/sync-github",
-                    json={"repo": "sahaveer/hypermesh-mobile-app", "token": "ghp_test"},
+                    json={"repo": "sahaveer/hypermesh-mobile-app", "token": "test_token_value"},
                 )
                 self.assertEqual(res.status_code, 200, res.text)
                 payload = res.json()

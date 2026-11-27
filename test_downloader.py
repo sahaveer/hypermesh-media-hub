@@ -180,4 +180,99 @@ class DownloaderTests(unittest.TestCase):
         self.assertEqual(payload['youtube_results'][0]['id'], 'yt-1')
         mock_yt.assert_called_once()
 
+    def test_pause_resume_and_clear_preserves_paused_task(self):
+        client = TestClient(main.app)
+        with tempfile.TemporaryDirectory(dir=config.DATA_DIR) as directory:
+            root = pathlib.Path(directory)
+            part_file = root / 'Demo [vid1].mp4.part'
+            part_file.write_bytes(b'partial')
+            proc = MagicMock()
+            proc.poll.return_value = None
+            task_id = 'pause-task-1'
+            with downloader._lock:
+                downloader._download_tasks[task_id] = {
+                    'id': task_id,
+                    'url': 'https://www.youtube.com/watch?v=vid1',
+                    'title': 'Demo Video',
+                    'format': 'video',
+                    'quality': 'best',
+                    'destination': 'server',
+                    'owner_id': 'host',
+                    'owner_name': 'Host',
+                    'cookies_browser': None,
+                    'target_playlist_id': None,
+                    'status': 'downloading',
+                    'progress': 42.5,
+                    'speed': 1024,
+                    'eta': 10,
+                    'target_dir': str(root),
+                    'error': None,
+                    '_existing_files': [],
+                    '_tracked_files': [str(root / 'Demo [vid1].mp4')],
+                    '_video_id': 'vid1',
+                }
+                downloader._active_processes[task_id] = proc
+
+            with patch('downloader.subprocess.run'), patch('downloader.os.killpg', create=True):
+                res = client.post(f'/api/downloads/{task_id}/pause')
+            self.assertEqual(res.status_code, 200)
+            self.assertEqual(res.json()['task']['status'], 'paused')
+            self.assertTrue(part_file.exists())
+            proc.wait.assert_called_once()
+
+            # Clear inactive should keep paused downloads
+            downloader.clear_downloads()
+            self.assertIsNotNone(downloader.get_download_status(task_id))
+
+            with patch('downloader.threading.Thread') as mock_thread:
+                res_resume = client.post(f'/api/downloads/{task_id}/resume')
+            self.assertEqual(res_resume.status_code, 200)
+            self.assertEqual(res_resume.json()['task']['status'], 'pending')
+            mock_thread.assert_called_once()
+
+    def test_delete_while_processing_kills_worker_and_cleans_only_task_files(self):
+        client = TestClient(main.app)
+        with tempfile.TemporaryDirectory(dir=config.DATA_DIR) as directory:
+            root = pathlib.Path(directory)
+            preexisting = root / 'Keep Me.mp3'
+            preexisting.write_bytes(b'existing-audio')
+            partial = root / 'In Progress [abc999].webm.part'
+            partial.write_bytes(b'partial-bytes')
+            temp_media = root / 'In Progress [abc999].webm'
+            temp_media.write_bytes(b'temp-bytes')
+
+            proc = MagicMock()
+            proc.poll.return_value = None
+            task_id = 'del-proc-1'
+            with downloader._lock:
+                downloader._download_tasks[task_id] = {
+                    'id': task_id,
+                    'url': 'https://www.youtube.com/watch?v=abc999',
+                    'title': 'In Progress',
+                    'format': 'audio',
+                    'quality': 'best',
+                    'destination': 'server',
+                    'owner_id': 'host',
+                    'owner_name': 'Host',
+                    'cookies_browser': None,
+                    'target_playlist_id': None,
+                    'status': 'processing',
+                    'progress': 100,
+                    'target_dir': str(root),
+                    'error': None,
+                    '_existing_files': ['Keep Me.mp3'],
+                    '_tracked_files': [str(temp_media), str(partial)],
+                    '_video_id': 'abc999',
+                }
+                downloader._active_processes[task_id] = proc
+
+            with patch('downloader.subprocess.run'), patch('downloader.os.killpg', create=True):
+                res = client.delete(f'/api/downloads/{task_id}')
+            self.assertEqual(res.status_code, 200)
+            self.assertIsNone(downloader.get_download_status(task_id))
+            proc.wait.assert_called_once()
+            self.assertFalse(partial.exists())
+            self.assertFalse(temp_media.exists())
+            self.assertTrue(preexisting.exists())
+
 if __name__=='__main__': unittest.main()

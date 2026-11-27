@@ -36,3 +36,8 @@ data/*.bak
 data/settings.json
 data/apk/
 *.apk
+
+# Local AI workspace instructions (keep out of public repo)
+AGENTS.md
+CLAUDE.md
+GEMINI.md

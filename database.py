@@ -859,22 +859,42 @@ def update_playlist(playlist_id: str, name: Optional[str] = None, description: O
         conn.commit()
         return cursor.rowcount > 0
 
-def get_playlist_songs(playlist_id: str) -> List[Dict[str, Any]]:
+def get_playlist_songs(playlist_id: str, client_id: Optional[str] = None) -> List[Dict[str, Any]]:
     if playlist_id and playlist_id.startswith("smart:"):
         criteria = parse_smart_id_criteria(playlist_id)
         if not criteria:
             return []
-        return get_songs(genre=criteria.get("genre"), language=criteria.get("language"), decade=criteria.get("decade"))
+        return get_songs(
+            genre=criteria.get("genre"),
+            language=criteria.get("language"),
+            decade=criteria.get("decade"),
+            client_id=client_id
+        )
 
     with get_db_connection() as conn:
         cursor = conn.cursor()
-        cursor.execute("""
-            SELECT s.* FROM songs s
-            JOIN playlist_songs ps ON s.id = ps.song_id
-            WHERE ps.playlist_id = ?
-            ORDER BY ps.position ASC
-        """, (playlist_id,))
-        return [dict(row) for row in cursor.fetchall()]
+        if client_id:
+            cursor.execute("""
+                SELECT s.*,
+                       EXISTS(SELECT 1 FROM favorites f WHERE f.media_id = s.id AND f.client_id = ?) AS is_favorite,
+                       (s.owner_id = ? OR (s.owner_id = 'host' AND ? = 'host')) AS is_owner
+                FROM songs s
+                JOIN playlist_songs ps ON s.id = ps.song_id
+                WHERE ps.playlist_id = ?
+                ORDER BY ps.position ASC
+            """, (client_id, client_id, client_id, playlist_id))
+        else:
+            cursor.execute("""
+                SELECT s.*, 0 AS is_favorite, 0 AS is_owner FROM songs s
+                JOIN playlist_songs ps ON s.id = ps.song_id
+                WHERE ps.playlist_id = ?
+                ORDER BY ps.position ASC
+            """, (playlist_id,))
+        rows = [dict(row) for row in cursor.fetchall()]
+        for r in rows:
+            r["is_favorite"] = bool(r.get("is_favorite", 0))
+            r["is_owner"] = bool(r.get("is_owner", 0))
+        return rows
 
 def get_auto_generated_playlists(media_type: str = "audio") -> List[Dict[str, Any]]:
     """

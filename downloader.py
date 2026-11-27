@@ -1,5 +1,6 @@
 import os
 import re
+import glob
 import time
 import uuid
 import shutil
@@ -13,7 +14,7 @@ import sys
 import subprocess
 import signal
 import importlib.util
-from typing import Dict, Any, Optional, Tuple, List
+from typing import Dict, Any, Optional, Tuple, List, Set
 import yt_dlp
 
 # Detect FFmpeg: prioritize system ffmpeg (e.g. Linux /usr/bin/ffmpeg or Windows PATH)
@@ -49,7 +50,98 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("downloader")
 
 _download_tasks: Dict[str, Dict[str, Any]] = {}
+_active_processes: Dict[str, subprocess.Popen] = {}
+_worker_done_events: Dict[str, threading.Event] = {}
 _lock = threading.Lock()
+
+
+class _DownloadInterrupted(Exception):
+    """Raised inside progress hooks when a task is paused or deleted."""
+
+
+def _public_task_copy(task: Dict[str, Any]) -> Dict[str, Any]:
+    return {k: v for k, v in task.items() if not k.startswith("_")}
+
+
+def _terminate_process(process: Optional[subprocess.Popen]) -> None:
+    if not process or process.poll() is not None:
+        return
+    try:
+        if os.name == "nt":
+            subprocess.run(
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+            )
+        else:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        process.wait(timeout=5)
+    except Exception:
+        pass
+
+
+def _record_tracked_file(task: Dict[str, Any], path_str: Optional[str]) -> None:
+    if not path_str:
+        return
+    tracked = task.setdefault("_tracked_files", [])
+    if path_str not in tracked:
+        tracked.append(path_str)
+
+
+def _cleanup_partial_files(task: Dict[str, Any]) -> None:
+    destination = task.get("destination", "server")
+    target_dir_str = task.get("target_dir")
+    if not target_dir_str:
+        return
+    target_dir = pathlib.Path(target_dir_str)
+
+    if destination == "client":
+        shutil.rmtree(target_dir, ignore_errors=True)
+        return
+
+    if not target_dir.exists() or not target_dir.is_dir():
+        return
+
+    existing_files: Set[str] = set(task.get("_existing_files") or [])
+    tracked_files: List[str] = list(task.get("_tracked_files") or [])
+    if task.get("file_path"):
+        tracked_files.append(str(task["file_path"]))
+    video_id = str(task.get("_video_id") or "").strip()
+
+    candidates: Set[pathlib.Path] = set()
+    for raw_path in tracked_files:
+        try:
+            p = pathlib.Path(raw_path)
+            candidates.add(p)
+            for suffix in (".part", ".ytdl", ".temp"):
+                candidates.add(pathlib.Path(str(p) + suffix))
+            stem = p.stem
+            if stem:
+                for match in target_dir.glob(f"{glob.escape(stem)}*"):
+                    candidates.add(match)
+        except Exception:
+            continue
+
+    if video_id:
+        for match in target_dir.glob(f"*[{glob.escape(video_id)}]*"):
+            candidates.add(match)
+
+    target_resolved = target_dir.resolve()
+    for candidate in candidates:
+        try:
+            if candidate.name in existing_files:
+                continue
+            resolved = candidate.resolve()
+            if resolved.parent != target_resolved:
+                continue
+            if resolved.is_file():
+                resolved.unlink(missing_ok=True)
+        except Exception:
+            continue
 
 
 def _youtube_runtime():
@@ -155,8 +247,9 @@ def _resolve_media_url(raw_input: str) -> Tuple[str, Optional[str]]:
 def get_download_status(task_id: Optional[str] = None) -> Any:
     with _lock:
         if task_id:
-            return _download_tasks.get(task_id)
-        return list(_download_tasks.values())
+            task = _download_tasks.get(task_id)
+            return _public_task_copy(task) if task else None
+        return [_public_task_copy(t) for t in _download_tasks.values()]
 
 def get_download_file(task_id: str) -> Optional[pathlib.Path]:
     with _lock:
@@ -175,11 +268,17 @@ def get_download_file(task_id: str) -> Optional[pathlib.Path]:
 def _progress_hook(d: Dict[str, Any], task_id: str):
     with _lock:
         if task_id not in _download_tasks:
-            return
+            raise _DownloadInterrupted("Download was deleted.")
         task = _download_tasks[task_id]
+        if task.get("status") in ("paused", "cancelled"):
+            raise _DownloadInterrupted(f"Download {task.get('status')}.")
         info = d.get('info_dict') or {}
         if info.get('title'):
             task['title'] = info['title']
+        if info.get('id'):
+            task['_video_id'] = str(info['id'])
+        _record_tracked_file(task, d.get("filename"))
+        _record_tracked_file(task, d.get("tmpfilename"))
 
         if d.get("status") == "downloading":
             total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
@@ -194,6 +293,8 @@ def _progress_hook(d: Dict[str, Any], task_id: str):
         elif d.get("status") == "finished":
             task["status"] = "processing"
             task["progress"] = 100
+            task["speed"] = 0
+            task["eta"] = None
 
 def _perform_download(
     task_id: str,
@@ -323,6 +424,16 @@ def _perform_download(
             else:
                 entry = info or {}
 
+            with _lock:
+                if task_id not in _download_tasks or task.get("status") in ("paused", "cancelled"):
+                    return
+                if entry.get("id"):
+                    task["_video_id"] = str(entry["id"])
+                try:
+                    _record_tracked_file(task, ydl.prepare_filename(entry))
+                except Exception:
+                    pass
+
             raw_title = entry.get("title") or resolved_hint or "Downloaded Media"
             artist_name = entry.get("artist") or entry.get("uploader") or ""
             downloaded_file = _locate_file(ydl, entry)
@@ -353,6 +464,8 @@ def _perform_download(
                     raw_title = downloaded_file.stem
 
             with _lock:
+                if task_id not in _download_tasks or task.get("status") in ("paused", "cancelled"):
+                    return
                 task["title"] = raw_title
                 task["artist"] = artist_name
                 task["song_id"] = song_id
@@ -366,7 +479,13 @@ def _perform_download(
         if destination == "server":
             threading.Thread(target=scanner.scan_library, daemon=True).start()
 
+    except _DownloadInterrupted:
+        logger.info(f"Download task {task_id} interrupted (paused or cancelled).")
+        return
     except Exception as e:
+        with _lock:
+            if task_id not in _download_tasks or task.get("status") in ("paused", "cancelled"):
+                return
         logger.warning(f"Download with standard opts failed ({e}), attempting fallback stream download...")
         try:
             fallback_opts: Dict[str, Any] = {
@@ -404,6 +523,16 @@ def _perform_download(
                 else:
                     entry = info or {}
 
+                with _lock:
+                    if task_id not in _download_tasks or task.get("status") in ("paused", "cancelled"):
+                        return
+                    if entry.get("id"):
+                        task["_video_id"] = str(entry["id"])
+                    try:
+                        _record_tracked_file(task, ydl.prepare_filename(entry))
+                    except Exception:
+                        pass
+
                 raw_title = entry.get("title") or resolved_hint or "Downloaded Media"
                 artist_name = entry.get("artist") or entry.get("uploader") or ""
                 downloaded_file = _locate_file(ydl, entry)
@@ -434,6 +563,8 @@ def _perform_download(
                         raw_title = downloaded_file.stem
 
                 with _lock:
+                    if task_id not in _download_tasks or task.get("status") in ("paused", "cancelled"):
+                        return
                     task["title"] = raw_title
                     task["artist"] = artist_name
                     task["song_id"] = song_id
@@ -447,7 +578,13 @@ def _perform_download(
             if destination == "server":
                 threading.Thread(target=scanner.scan_library, daemon=True).start()
 
+        except _DownloadInterrupted:
+            logger.info(f"Download task {task_id} interrupted during fallback (paused or cancelled).")
+            return
         except Exception as err:
+            with _lock:
+                if task_id not in _download_tasks or task.get("status") in ("paused", "cancelled"):
+                    return
             logger.error(f"Download task {task_id} failed: {err}")
             clean_err = str(err)
             if "DRM" in clean_err:
@@ -460,24 +597,37 @@ def _perform_download(
                 clean_err = "Access forbidden by media host (HTTP 403). Stream may be geo-restricted or require login cookies."
             
             with _lock:
-                task["status"] = "failed"
-                task["error"] = clean_err
-                if task["title"] == "Fetching metadata...":
-                    task["title"] = resolved_hint or raw_url.split("?")[0].split("/")[-1] or "Download Failed"
+                if task_id in _download_tasks and task.get("status") not in ("paused", "cancelled"):
+                    task["status"] = "failed"
+                    task["error"] = clean_err
+                    if task["title"] == "Fetching metadata...":
+                        task["title"] = resolved_hint or raw_url.split("?")[0].split("/")[-1] or "Download Failed"
 
 def _run_download(task_id, raw_url, media_format, quality, target_dir, destination="server", owner_id="host", owner_name="Host", cookies_browser=None):
     """Supervise an isolated worker so extractor hangs cannot leave pending tasks."""
     process = None
-    target_playlist_id = _download_tasks.get(task_id, {}).get("target_playlist_id")
+    done_event = threading.Event()
+    with _lock:
+        _worker_done_events[task_id] = done_event
+        task_ref = _download_tasks.get(task_id)
+        if not task_ref or task_ref.get("status") in ("paused", "cancelled"):
+            done_event.set()
+            return
+        target_playlist_id = task_ref.get("target_playlist_id")
     def fail(message):
         with _lock:
-            _download_tasks[task_id].update(status="failed", error=message, title=_download_tasks[task_id].get("title") or raw_url)
+            task = _download_tasks.get(task_id)
+            if task and task.get("status") not in ("paused", "cancelled", "completed"):
+                task.update(status="failed", error=message, title=task.get("title") or raw_url)
     try:
         if getattr(sys, "frozen", False):
             _perform_download(task_id, raw_url, media_format, quality, target_dir, destination, owner_id, owner_name, cookies_browser, target_playlist_id)
             return
         with _lock:
-            initial = dict(_download_tasks[task_id])
+            task_ref = _download_tasks.get(task_id)
+            if not task_ref or task_ref.get("status") in ("paused", "cancelled"):
+                return
+            initial = dict(task_ref)
         process = subprocess.Popen(
             [sys.executable, "-u", str(pathlib.Path(__file__).resolve()), "--download-worker"],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -485,6 +635,12 @@ def _run_download(task_id, raw_url, media_format, quality, target_dir, destinati
             start_new_session=os.name != "nt",
             creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
         )
+        with _lock:
+            task_ref = _download_tasks.get(task_id)
+            if not task_ref or task_ref.get("status") in ("paused", "cancelled"):
+                _terminate_process(process)
+                return
+            _active_processes[task_id] = process
         process.stdin.write(json.dumps(initial) + "\n")
         process.stdin.close()
         def read_updates():
@@ -494,8 +650,9 @@ def _run_download(task_id, raw_url, media_format, quality, target_dir, destinati
                 try:
                     update = json.loads(line[len("MEDIA_TASK:"):])
                     with _lock:
-                        if _download_tasks[task_id]["status"] not in ("failed", "completed"):
-                            _download_tasks[task_id].update(update)
+                        cur = _download_tasks.get(task_id)
+                        if cur and cur["status"] not in ("failed", "completed", "paused", "cancelled"):
+                            cur.update(update)
                 except (ValueError, TypeError):
                     continue
         reader = threading.Thread(target=read_updates, daemon=True)
@@ -504,32 +661,35 @@ def _run_download(task_id, raw_url, media_format, quality, target_dir, destinati
         while process.poll() is None:
             elapsed = time.monotonic() - started
             with _lock:
-                status = _download_tasks[task_id]["status"]
+                cur = _download_tasks.get(task_id)
+                status = cur["status"] if cur else "cancelled"
+            if status in ("paused", "cancelled"):
+                break
             if (status == "pending" and elapsed > 120) or elapsed > 1800:
                 fail("The server timed out fetching metadata. Check internet access and the yt-dlp JavaScript runtime setup." if status == "pending" else "Download exceeded the 30-minute limit. Try a lower quality or shorter video.")
                 return
             time.sleep(0.25)
         reader.join(timeout=3)
         with _lock:
-            status = _download_tasks[task_id]["status"]
-        if status not in ("completed", "failed"):
+            cur = _download_tasks.get(task_id)
+            status = cur["status"] if cur else "cancelled"
+        if status not in ("completed", "failed", "paused", "cancelled"):
             fail("The download worker stopped unexpectedly. Check the server's Python dependencies and folder permissions.")
     except Exception as error:
         logger.exception("Download worker failed")
         fail(f"Could not start download: {error}")
     finally:
+        with _lock:
+            if _active_processes.get(task_id) is process:
+                _active_processes.pop(task_id, None)
         if process:
-            if process.poll() is None:
-                if os.name == "nt":
-                    subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                else:
-                    try:
-                        os.killpg(process.pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
-                process.wait(timeout=10)
+            _terminate_process(process)
             if process.stdout:
-                process.stdout.close()
+                try:
+                    process.stdout.close()
+                except Exception:
+                    pass
+        done_event.set()
 
 
 def _download_worker():
@@ -602,6 +762,13 @@ def start_download(
     else:
         active_cookies_browser = None
 
+    existing_files: List[str] = []
+    if destination == "server" and target_dir.exists() and target_dir.is_dir():
+        try:
+            existing_files = [p.name for p in target_dir.iterdir()]
+        except Exception:
+            existing_files = []
+
     with _lock:
         _download_tasks[task_id] = {
             "id": task_id,
@@ -616,8 +783,13 @@ def start_download(
             "target_playlist_id": target_playlist_id,
             "status": "pending",
             "progress": 0,
+            "speed": 0,
+            "eta": None,
             "target_dir": str(target_dir),
-            "error": None
+            "error": None,
+            "_existing_files": existing_files,
+            "_tracked_files": [],
+            "_video_id": None,
         }
 
     thread = threading.Thread(
@@ -627,6 +799,90 @@ def start_download(
     )
     thread.start()
     return task_id
+
+
+def pause_download(task_id: str) -> Dict[str, Any]:
+    """Pauses an active download task while keeping partial files so it can be resumed."""
+    with _lock:
+        task = _download_tasks.get(task_id)
+        if not task:
+            raise KeyError("Download task not found.")
+        status = task.get("status")
+        if status == "paused":
+            return _public_task_copy(task)
+        if status in ("completed", "failed", "cancelled"):
+            raise ValueError(f"Cannot pause a task that is {status}.")
+        task["status"] = "paused"
+        task["speed"] = 0
+        task["eta"] = None
+        proc = _active_processes.get(task_id)
+        done_event = _worker_done_events.get(task_id)
+        result = _public_task_copy(task)
+
+    _terminate_process(proc)
+    if done_event:
+        done_event.wait(timeout=3)
+    return result
+
+
+def resume_download(task_id: str) -> Dict[str, Any]:
+    """Resumes a paused download task from partial files."""
+    with _lock:
+        task = _download_tasks.get(task_id)
+        if not task:
+            raise KeyError("Download task not found.")
+        if task.get("status") != "paused":
+            raise ValueError("Only paused downloads can be resumed.")
+        done_event = _worker_done_events.get(task_id)
+
+    if done_event:
+        done_event.wait(timeout=3)
+
+    with _lock:
+        task = _download_tasks.get(task_id)
+        if not task:
+            raise KeyError("Download task not found.")
+        if task.get("status") != "paused":
+            raise ValueError("Only paused downloads can be resumed.")
+        task["status"] = "pending"
+        task["error"] = None
+        task["speed"] = 0
+        task["eta"] = None
+        args = (
+            task_id,
+            task["url"],
+            task["format"],
+            task["quality"],
+            pathlib.Path(task["target_dir"]),
+            task.get("destination", "server"),
+            task.get("owner_id", "host"),
+            task.get("owner_name", "Host"),
+            task.get("cookies_browser"),
+        )
+        result = _public_task_copy(task)
+
+    threading.Thread(target=_run_download, args=args, daemon=True).start()
+    return result
+
+
+def delete_download(task_id: str) -> bool:
+    """Stops an active/paused download task, removes partial files, and deletes it from the queue."""
+    with _lock:
+        task = _download_tasks.pop(task_id, None)
+        if not task:
+            return False
+        was_completed = task.get("status") == "completed"
+        task["status"] = "cancelled"
+        proc = _active_processes.get(task_id)
+        done_event = _worker_done_events.get(task_id)
+
+    _terminate_process(proc)
+    if done_event:
+        done_event.wait(timeout=3)
+
+    if not was_completed or task.get("destination") == "client":
+        _cleanup_partial_files(task)
+    return True
 
 def search_youtube(query: str, limit: int = 8) -> List[Dict[str, Any]]:
     """
@@ -640,7 +896,6 @@ def search_youtube(query: str, limit: int = 8) -> List[Dict[str, Any]]:
     if resolved_hint:
         target = f"ytsearch{limit}:{resolved_hint}"
     elif target_url.startswith("ytsearch"):
-        # Replace ytsearch1: with ytsearch{limit}:
         _, _, search_term = target_url.partition(":")
         target = f"ytsearch{limit}:{search_term}"
     else:
@@ -704,7 +959,7 @@ def clear_downloads() -> None:
         global _download_tasks
         _download_tasks = {
             tid: t for tid, t in _download_tasks.items()
-            if t.get("status") in ("downloading", "pending", "processing")
+            if t.get("status") in ("downloading", "pending", "processing", "paused")
         }
 
 

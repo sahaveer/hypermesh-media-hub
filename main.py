@@ -133,6 +133,9 @@ class ReorderPlaylistRequest(BaseModel):
 class BatchDownloadSongsRequest(BaseModel):
     song_ids: List[str]
 
+class BatchDeleteMediaRequest(BaseModel):
+    media_ids: List[str]
+
 class UpdateSettingsRequest(BaseModel):
     device_name: Optional[str] = None
     sharing_enabled: Optional[bool] = None
@@ -251,6 +254,12 @@ def is_host_admin(request: Optional[Request]) -> bool:
     except Exception:
         pass
     return False
+
+def _attach_media_permissions(items: List[Dict[str, Any]], request: Request) -> List[Dict[str, Any]]:
+    admin = is_host_admin(request)
+    for item in items:
+        item["can_delete"] = bool(item.get("is_owner")) or admin
+    return items
 
 # --- Status & Settings API ---
 @app.post("/api/client/ping")
@@ -889,6 +898,7 @@ def get_live_peer_shares(
     """Returns active live shares broadcast by connected peers."""
     cleanup_expired_live_shares()
     cid = get_request_client_id(request, client_id)
+    admin = is_host_admin(request)
     with _shares_lock:
         shares = [dict(s) for s in _live_peer_shares.values()]
         
@@ -896,9 +906,35 @@ def get_live_peer_shares(
         shares = [s for s in shares if s.get("media_type") == media_type]
         
     for s in shares:
-        s["is_owner"] = (s.get("client_id") == cid or (s.get("client_id") == "host" and cid == "host"))
+        is_owner = (s.get("client_id") == cid or (s.get("client_id") == "host" and cid == "host"))
+        s["is_owner"] = is_owner
+        s["can_delete"] = is_owner or admin
         
     return {"shares": shares, "count": len(shares)}
+
+@app.delete("/api/peers/shares/{share_id}")
+def delete_live_peer_share(share_id: str, request: Request, client_id: Optional[str] = Query(None)):
+    """Stops and deletes an active live peer share (by owner or host admin)."""
+    cid = get_request_client_id(request, client_id)
+    with _shares_lock:
+        s = _live_peer_shares.get(share_id)
+        if not s:
+            raise HTTPException(status_code=404, detail="Live peer share not found")
+        owner_id = s.get("client_id") or "host"
+        is_authorized = (owner_id == cid) or is_host_admin(request)
+        if not is_authorized:
+            raise HTTPException(status_code=403, detail="Permission denied. Only the owner who shared this file can delete it.")
+        _live_peer_shares.pop(share_id, None)
+
+    if not s.get("copied_to_server") and s.get("file_path"):
+        try:
+            fpath = pathlib.Path(s["file_path"])
+            if fpath.exists():
+                fpath.unlink()
+        except Exception:
+            pass
+
+    return {"message": "Live share deleted successfully", "id": share_id}
 
 @app.get("/api/peers/shares/{share_id}/stream")
 def stream_live_peer_share(share_id: str, request: Request, download: bool = False):
@@ -1204,7 +1240,6 @@ def search_for_download(
 
     cid = get_request_client_id(request, client_id)
 
-    # 1. Check existing server library first (substring match, then multi-word token match)
     local_rows = database.get_songs(query=clean_q, media_type="all", client_id=cid, limit=15)
     if not local_rows and not clean_q.startswith(("http://", "https://")):
         tokens = [t.lower() for t in clean_q.split() if t.strip()]
@@ -1234,7 +1269,6 @@ def search_for_download(
         for r in local_rows
     ]
 
-    # When already present on the server, point directly to the server song/video and omit YouTube results.
     if local_matches and not include_youtube:
         return {
             "query": clean_q,
@@ -1285,6 +1319,32 @@ def enqueue_download(body: DownloadMediaRequest, request: Request):
 @app.get("/api/downloads/status")
 def get_downloads():
     return {"tasks": downloader.get_download_status()}
+
+@app.post("/api/downloads/{task_id}/pause")
+def pause_download_task(task_id: str):
+    try:
+        task = downloader.pause_download(task_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Download task not found")
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error))
+    return {"message": "Download paused", "task": task, "tasks": downloader.get_download_status()}
+
+@app.post("/api/downloads/{task_id}/resume")
+def resume_download_task(task_id: str):
+    try:
+        task = downloader.resume_download(task_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Download task not found")
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error))
+    return {"message": "Download resumed", "task": task, "tasks": downloader.get_download_status()}
+
+@app.delete("/api/downloads/{task_id}")
+def delete_download_task(task_id: str):
+    if not downloader.delete_download(task_id):
+        raise HTTPException(status_code=404, detail="Download task not found")
+    return {"message": "Download deleted", "tasks": downloader.get_download_status()}
 
 @app.post("/api/downloads/clear")
 def clear_download_history():
@@ -1641,6 +1701,7 @@ def list_songs(
         limit=limit,
         offset=offset
     )
+    _attach_media_permissions(songs, request)
     return {"songs": songs, "count": len(songs)}
 
 @app.get("/api/videos")
@@ -1674,6 +1735,7 @@ def list_videos(
         limit=limit,
         offset=offset
     )
+    _attach_media_permissions(videos, request)
     return {"videos": videos, "count": len(videos)}
 
 @app.put("/api/media/{media_id}")
@@ -1700,6 +1762,8 @@ def get_my_media(request: Request, client_id: Optional[str] = Query(None)):
     cid = get_request_client_id(request, client_id)
     my_songs = database.get_songs(media_type="audio", client_id=cid, scope="mine", limit=1000)
     my_videos = database.get_videos(client_id=cid, scope="mine", limit=500)
+    _attach_media_permissions(my_songs, request)
+    _attach_media_permissions(my_videos, request)
     return {
         "client_id": cid,
         "songs": my_songs,
@@ -1725,6 +1789,7 @@ def list_favorites(
         limit=limit,
         offset=offset
     )
+    _attach_media_permissions(items, request)
     return {"favorites": items, "count": len(items)}
 
 @app.post("/api/media/{media_id}/favorite")
@@ -1736,32 +1801,72 @@ def toggle_media_favorite(media_id: str, request: Request, client_id: Optional[s
     is_fav = database.toggle_favorite(cid, media_id)
     return {"media_id": media_id, "is_favorite": is_fav}
 
-@app.delete("/api/media/{media_id}")
-def delete_media_item(media_id: str, request: Request, client_id: Optional[str] = Query(None)):
-    cid = get_request_client_id(request, client_id)
+def _remove_media_file_from_disk(file_path: Optional[str]) -> None:
+    if not file_path or not os.path.exists(file_path):
+        return
+    try:
+        os.remove(file_path)
+    except PermissionError:
+        time.sleep(0.15)
+        try:
+            os.remove(file_path)
+        except OSError as exc:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Could not delete file from disk (it may be in use or read-only): {exc}"
+            )
+    except OSError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Could not delete file from disk: {exc}"
+        )
+
+def _delete_single_media_item(media_id: str, request: Request, cid: str) -> Dict[str, Any]:
     song = database.get_song(media_id)
     if not song:
         raise HTTPException(status_code=404, detail="Media item not found")
-    
+
     # Ownership guard: Only the owner device or host admin can delete
     owner_id = song.get("owner_id") or "host"
-    is_owner = (owner_id == cid) or (owner_id == "host" and is_host_admin(request)) or is_host_admin(request)
-    if not is_owner:
+    is_authorized = (owner_id == cid) or is_host_admin(request)
+    if not is_authorized:
         raise HTTPException(
             status_code=403,
             detail="Permission denied. Only the owner who shared this file can delete it."
         )
 
-    # Delete the physical file from disk if it exists
-    file_path = song.get("path")
-    if file_path and os.path.exists(file_path):
-        try:
-            os.remove(file_path)
-        except Exception:
-            pass
-
+    _remove_media_file_from_disk(song.get("path"))
     database.delete_media(media_id)
+    return song
+
+@app.delete("/api/media/{media_id}")
+def delete_media_item(media_id: str, request: Request, client_id: Optional[str] = Query(None)):
+    cid = get_request_client_id(request, client_id)
+    _delete_single_media_item(media_id, request, cid)
     return {"message": "Media deleted successfully", "id": media_id}
+
+@app.post("/api/media/batch-delete")
+def batch_delete_media_items(body: BatchDeleteMediaRequest, request: Request, client_id: Optional[str] = Query(None)):
+    if not body.media_ids:
+        raise HTTPException(status_code=400, detail="No media items specified")
+    cid = get_request_client_id(request, client_id)
+    deleted_ids: List[str] = []
+    errors: List[Dict[str, Any]] = []
+    for media_id in body.media_ids:
+        try:
+            _delete_single_media_item(media_id, request, cid)
+            deleted_ids.append(media_id)
+        except HTTPException as exc:
+            errors.append({"id": media_id, "status_code": exc.status_code, "detail": exc.detail})
+    if not deleted_ids and errors:
+        first_err = errors[0]
+        raise HTTPException(status_code=first_err["status_code"], detail=first_err["detail"])
+    return {
+        "deleted_ids": deleted_ids,
+        "deleted_count": len(deleted_ids),
+        "failed": errors,
+        "message": f"Deleted {len(deleted_ids)} item(s) successfully"
+    }
 
 @app.get("/api/song/{song_id}")
 def get_song_details(song_id: str, request: Request, client_id: Optional[str] = Query(None)):
@@ -1769,6 +1874,7 @@ def get_song_details(song_id: str, request: Request, client_id: Optional[str] = 
     song = database.get_song(song_id, client_id=cid)
     if not song:
         raise HTTPException(status_code=404, detail="Media item not found")
+    _attach_media_permissions([song], request)
     return song
 
 @app.get("/api/artists")
@@ -1885,11 +1991,13 @@ async def import_playlist_endpoint(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=f"Failed to import playlist: {e}")
 
 @app.get("/api/playlists/{playlist_id}")
-def get_playlist_details(playlist_id: str):
+def get_playlist_details(playlist_id: str, request: Request, client_id: Optional[str] = Query(None)):
     pl = database.get_playlist(playlist_id)
     if not pl:
         raise HTTPException(status_code=404, detail="Playlist not found")
-    songs = database.get_playlist_songs(playlist_id)
+    cid = get_request_client_id(request, client_id)
+    songs = database.get_playlist_songs(playlist_id, client_id=cid)
+    _attach_media_permissions(songs, request)
     return {"playlist": pl, "songs": songs}
 
 @app.put("/api/playlists/{playlist_id}")
@@ -1901,8 +2009,11 @@ def update_playlist_info(playlist_id: str, body: UpdatePlaylistRequest):
     return {"message": "Playlist updated", "playlist": database.get_playlist(playlist_id)}
 
 @app.get("/api/playlists/{playlist_id}/songs")
-def get_playlist_tracks(playlist_id: str):
-    return {"songs": database.get_playlist_songs(playlist_id)}
+def get_playlist_tracks(playlist_id: str, request: Request, client_id: Optional[str] = Query(None)):
+    cid = get_request_client_id(request, client_id)
+    songs = database.get_playlist_songs(playlist_id, client_id=cid)
+    _attach_media_permissions(songs, request)
+    return {"songs": songs}
 
 @app.post("/api/playlists/{playlist_id}/songs")
 def add_songs_to_pl_batch(playlist_id: str, body: AddSongsToPlaylistRequest):
