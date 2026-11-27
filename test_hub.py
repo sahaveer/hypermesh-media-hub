@@ -1,5 +1,6 @@
 import os
 import pathlib
+import unittest
 import wave
 import struct
 import math
@@ -543,6 +544,12 @@ def test_decentralized_hub():
     # Restore user production settings so test folders do not pollute media library
     settings.save_settings(original_settings)
     scanner.scan_library()
+
+
+class HubIntegrationTests(unittest.TestCase):
+    def test_decentralized_hub_flow(self):
+        test_decentralized_hub()
+
 
 if __name__ == "__main__":
     test_decentralized_hub()

@@ -290,6 +290,11 @@ const dlSearchBtn = document.getElementById('dl-search-btn');
 const dlSearchResultsEl = document.getElementById('dl-search-results');
 const dlQualitySelect = document.getElementById('dl-quality-select');
 const dlCookiesSelect = document.getElementById('dl-cookies-select');
+const dlPlaylistCheckbox = document.getElementById('dl-playlist-checkbox');
+const dlSubtitlesCheckbox = document.getElementById('dl-subtitles-checkbox');
+const dlClipStartInput = document.getElementById('dl-clip-start');
+const dlClipEndInput = document.getElementById('dl-clip-end');
+const dlProxyInput = document.getElementById('dl-proxy-input');
 const startDownloadBtn = document.getElementById('start-download-btn');
 const clearDownloadsBtn = document.getElementById('clear-downloads-btn');
 
@@ -297,6 +302,9 @@ const clearDownloadsBtn = document.getElementById('clear-downloads-btn');
 const masterSharingToggle = document.getElementById('master-sharing-toggle');
 const deviceNameInput = document.getElementById('device-name-input');
 const saveDeviceNameBtn = document.getElementById('save-device-name-btn');
+const maxConcurrentSelect = document.getElementById('max-concurrent-downloads-select');
+const rateLimitInput = document.getElementById('download-rate-limit-input');
+const saveDownloaderSettingsBtn = document.getElementById('save-downloader-settings-btn');
 const addFolderBtn = document.getElementById('add-folder-btn');
 
 // Photos Elements
@@ -994,6 +1002,15 @@ async function fetchSettings() {
     deviceNameInput.value = data.device_name || '';
     deviceNameInput.disabled = !state.isAdmin;
     if (saveDeviceNameBtn) saveDeviceNameBtn.disabled = !state.isAdmin;
+    if (maxConcurrentSelect) {
+      maxConcurrentSelect.value = String(data.max_concurrent_downloads || 2);
+      maxConcurrentSelect.disabled = !state.isAdmin;
+    }
+    if (rateLimitInput) {
+      rateLimitInput.value = String(data.download_rate_limit_kbps || 0);
+      rateLimitInput.disabled = !state.isAdmin;
+    }
+    if (saveDownloaderSettingsBtn) saveDownloaderSettingsBtn.disabled = !state.isAdmin;
     if (addFolderBtn) addFolderBtn.style.display = state.isAdmin ? 'inline-flex' : 'none';
 
     if (approvalQueueToggle) {
@@ -1961,6 +1978,11 @@ async function enqueueDownloaderUrl(url, { destinationOverride = null, autoPlay 
   const quality = dlQualitySelect.value;
   const destination = destinationOverride || document.querySelector('input[name="dl-destination"]:checked')?.value || 'server';
   const cookies_browser = dlCookiesSelect ? (dlCookiesSelect.value || null) : null;
+  const clip_start = dlClipStartInput ? (dlClipStartInput.value.trim() || null) : null;
+  const clip_end = dlClipEndInput ? (dlClipEndInput.value.trim() || null) : null;
+  const subtitles = dlSubtitlesCheckbox ? Boolean(dlSubtitlesCheckbox.checked) : false;
+  const download_playlist = dlPlaylistCheckbox ? Boolean(dlPlaylistCheckbox.checked) : false;
+  const proxy = dlProxyInput ? (dlProxyInput.value.trim() || null) : null;
 
   const res = await apiFetch('/api/download', {
     method: 'POST',
@@ -1973,6 +1995,11 @@ async function enqueueDownloaderUrl(url, { destinationOverride = null, autoPlay 
       destination,
       cookies_browser,
       target_playlist_id: dlPlaylistSelect ? (dlPlaylistSelect.value || null) : null,
+      clip_start,
+      clip_end,
+      subtitles,
+      download_playlist,
+      proxy,
       client_id: clientId,
       device_name: getDeviceType()
     })
@@ -2246,7 +2273,7 @@ async function pollDownloads() {
       fetchFavorites();
     }
 
-    const hasActive = data.tasks.some(t => t.status === 'downloading' || t.status === 'pending' || t.status === 'processing');
+    const hasActive = data.tasks.some(t => t.status === 'downloading' || t.status === 'pending' || t.status === 'processing' || t.status === 'queued');
     if (hasActive && !dlPollInterval) {
       dlPollInterval = setInterval(pollDownloads, 1500);
     } else if (!hasActive && dlPollInterval) {
@@ -2296,21 +2323,27 @@ function renderDownloads(tasks) {
     const isClient = task.destination === 'client';
     const isFailed = task.status === 'failed';
     const isPaused = task.status === 'paused';
+    const isQueued = task.status === 'queued';
     const isDownloading = task.status === 'downloading';
     const isProcessing = task.status === 'processing';
-    const isActive = isDownloading || isProcessing || task.status === 'pending';
+    const isActive = isDownloading || isProcessing || task.status === 'pending' || isQueued;
 
     let speedText = '';
-    if (isDownloading && task.speed) {
-      speedText = ` • ${formatBytes(task.speed)}/s`;
+    if (isDownloading && (task.speed || task.total_bytes)) {
+      if (task.downloaded_bytes && task.total_bytes) {
+        speedText += ` • ${formatBytes(task.downloaded_bytes)} / ${formatBytes(task.total_bytes)}`;
+      }
+      if (task.speed) speedText += ` • ${formatBytes(task.speed)}/s`;
       if (task.eta) speedText += ` (ETA ${task.eta}s)`;
     } else if (isPaused) {
       speedText = ` • Paused at ${Math.round(task.progress || 0)}%`;
+    } else if (isQueued) {
+      speedText = ' • Queued (waiting for slot)';
     } else if (isProcessing) {
       speedText = ' • Processing media...';
     }
 
-    const barColor = isFailed ? '#ef4444' : (isPaused ? '#f59e0b' : '');
+    const barColor = isFailed ? '#ef4444' : (isPaused ? '#f59e0b' : (isQueued ? '#6366f1' : ''));
 
     item.innerHTML = `
       <div class="download-task-header">
@@ -2334,9 +2367,14 @@ function renderDownloads(tasks) {
               ⏸ Pause
             </button>
           ` : ''}
-          ${isPaused ? `
+          ${(isPaused || isFailed) ? `
             <button type="button" class="primary-btn dl-task-btn resume-dl-btn" title="Resume download">
               ▶️ Resume
+            </button>
+          ` : ''}
+          ${(isPaused || isFailed || isQueued) ? `
+            <button type="button" class="secondary-btn dl-task-btn edit-dl-btn" title="Edit URL or proxy mid-download">
+              ✏️ Edit
             </button>
           ` : ''}
           ${isFailed ? `
@@ -2405,6 +2443,34 @@ function renderDownloads(tasks) {
           alert(`Resume failed: ${err.message || err}`);
           resumeBtn.disabled = false;
           resumeBtn.textContent = '▶️ Resume';
+        }
+      });
+    }
+
+    const editBtn = item.querySelector('.edit-dl-btn');
+    if (editBtn) {
+      editBtn.addEventListener('click', async (e) => {
+        e.stopPropagation();
+        const newUrl = prompt('Update download URL (keeps partial progress):', task.url || '');
+        if (newUrl === null) return;
+        const newProxy = prompt('Optional proxy URL (leave blank for none):', task.proxy || '');
+        if (newProxy === null) return;
+        try {
+          const res = await apiFetch(`/api/downloads/${encodeURIComponent(task.id)}`, {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              url: newUrl.trim() || task.url,
+              proxy: newProxy.trim()
+            })
+          });
+          if (!res.ok) {
+            const err = await res.json().catch(() => ({}));
+            throw new Error(err.detail || 'Could not update download task.');
+          }
+          pollDownloads();
+        } catch (err) {
+          alert(`Edit failed: ${err.message || err}`);
         }
       });
     }
@@ -2521,6 +2587,28 @@ saveDeviceNameBtn.addEventListener('click', async () => {
     fetchStatus();
   }
 });
+
+if (saveDownloaderSettingsBtn) {
+  saveDownloaderSettingsBtn.addEventListener('click', async () => {
+    try {
+      const maxConc = parseInt(maxConcurrentSelect?.value || '2', 10) || 2;
+      const rateLimit = Math.max(0, parseInt(rateLimitInput?.value || '0', 10) || 0);
+      const res = await apiFetch('/api/settings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          max_concurrent_downloads: maxConc,
+          download_rate_limit_kbps: rateLimit
+        })
+      });
+      if (!res.ok) throw new Error('Could not save downloader settings.');
+      showToast('Downloader limits saved', 'success');
+      fetchSettings();
+    } catch (err) {
+      alert(`Error saving downloader settings: ${err.message || err}`);
+    }
+  });
+}
 
 // Add Folder Modal Elements & Handlers
 const addFolderModal = document.getElementById('add-folder-modal');

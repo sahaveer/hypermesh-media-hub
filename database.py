@@ -7,6 +7,7 @@ import pathlib
 import logging
 import shutil
 import time
+from contextlib import closing
 from typing import List, Optional, Dict, Any
 from config import DB_PATH
 
@@ -63,7 +64,7 @@ def init_db():
             raise
 
 def _do_init_db():
-    with get_db_connection() as conn:
+    with closing(get_db_connection()) as conn, conn:
         cursor = conn.cursor()
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS songs (
@@ -222,6 +223,47 @@ def _do_init_db():
         """)
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_statuses_expires ON statuses(expires_at)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_statuses_owner ON statuses(owner_id)")
+
+        # Persistent Download Queue Table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS download_tasks (
+                id TEXT PRIMARY KEY,
+                url TEXT NOT NULL,
+                title TEXT,
+                format TEXT DEFAULT 'audio',
+                quality TEXT DEFAULT 'best',
+                destination TEXT DEFAULT 'server',
+                owner_id TEXT DEFAULT 'host',
+                owner_name TEXT DEFAULT 'Host',
+                cookies_browser TEXT,
+                target_playlist_id TEXT,
+                status TEXT DEFAULT 'pending',
+                progress REAL DEFAULT 0,
+                speed REAL DEFAULT 0,
+                eta REAL,
+                downloaded_bytes INTEGER DEFAULT 0,
+                total_bytes INTEGER DEFAULT 0,
+                target_dir TEXT,
+                file_path TEXT,
+                download_url TEXT,
+                song_id TEXT,
+                duration REAL DEFAULT 0,
+                error TEXT,
+                clip_start TEXT,
+                clip_end TEXT,
+                subtitles INTEGER DEFAULT 0,
+                download_playlist INTEGER DEFAULT 0,
+                custom_headers TEXT,
+                proxy_url TEXT,
+                video_id TEXT,
+                existing_files TEXT,
+                tracked_files TEXT,
+                created_at REAL,
+                updated_at REAL
+            )
+        """)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_download_tasks_created ON download_tasks(created_at)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_download_tasks_status ON download_tasks(status)")
         conn.commit()
 
 def upsert_song(song_data: Dict[str, Any]):
@@ -1472,4 +1514,147 @@ def cleanup_expired_statuses(now: float) -> List[str]:
         cursor.execute("DELETE FROM statuses WHERE expires_at <= ?", (now,))
         conn.commit()
         return paths
+
+
+# --- Persistent Download Tasks Queue ---
+def upsert_download_task(task: Dict[str, Any]):
+    """Persists or updates a download task record in SQLite."""
+    now = time.time()
+    created_at = float(task.get("created_at") or now)
+    with closing(get_db_connection()) as conn, conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO download_tasks (
+                id, url, title, format, quality, destination,
+                owner_id, owner_name, cookies_browser, target_playlist_id,
+                status, progress, speed, eta, downloaded_bytes, total_bytes,
+                target_dir, file_path, download_url, song_id, duration, error,
+                clip_start, clip_end, subtitles, download_playlist,
+                custom_headers, proxy_url, video_id, existing_files, tracked_files,
+                created_at, updated_at
+            ) VALUES (
+                ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?,
+                ?, ?, ?, ?, ?,
+                ?, ?
+            )
+            ON CONFLICT(id) DO UPDATE SET
+                url = excluded.url,
+                title = excluded.title,
+                format = excluded.format,
+                quality = excluded.quality,
+                destination = excluded.destination,
+                owner_id = excluded.owner_id,
+                owner_name = excluded.owner_name,
+                cookies_browser = excluded.cookies_browser,
+                target_playlist_id = excluded.target_playlist_id,
+                status = excluded.status,
+                progress = excluded.progress,
+                speed = excluded.speed,
+                eta = excluded.eta,
+                downloaded_bytes = excluded.downloaded_bytes,
+                total_bytes = excluded.total_bytes,
+                target_dir = excluded.target_dir,
+                file_path = excluded.file_path,
+                download_url = excluded.download_url,
+                song_id = excluded.song_id,
+                duration = excluded.duration,
+                error = excluded.error,
+                clip_start = excluded.clip_start,
+                clip_end = excluded.clip_end,
+                subtitles = excluded.subtitles,
+                download_playlist = excluded.download_playlist,
+                custom_headers = excluded.custom_headers,
+                proxy_url = excluded.proxy_url,
+                video_id = excluded.video_id,
+                existing_files = excluded.existing_files,
+                tracked_files = excluded.tracked_files,
+                updated_at = excluded.updated_at
+        """, (
+            str(task["id"]),
+            str(task.get("url") or ""),
+            task.get("title"),
+            task.get("format", "audio"),
+            task.get("quality", "best"),
+            task.get("destination", "server"),
+            task.get("owner_id", "host"),
+            task.get("owner_name", "Host"),
+            task.get("cookies_browser"),
+            task.get("target_playlist_id"),
+            task.get("status", "pending"),
+            float(task.get("progress") or 0),
+            float(task.get("speed") or 0),
+            task.get("eta"),
+            int(task.get("downloaded_bytes") or 0),
+            int(task.get("total_bytes") or 0),
+            task.get("target_dir"),
+            task.get("file_path"),
+            task.get("download_url"),
+            task.get("song_id"),
+            float(task.get("duration") or 0),
+            task.get("error"),
+            task.get("clip_start"),
+            task.get("clip_end"),
+            1 if task.get("subtitles") else 0,
+            1 if task.get("download_playlist") else 0,
+            json.dumps(task.get("headers")) if task.get("headers") else None,
+            task.get("proxy"),
+            task.get("_video_id"),
+            json.dumps(list(task.get("_existing_files") or [])),
+            json.dumps(list(task.get("_tracked_files") or [])),
+            created_at,
+            now,
+        ))
+        conn.commit()
+
+
+def get_download_tasks() -> List[Dict[str, Any]]:
+    """Loads all persisted download tasks ordered from oldest to newest."""
+    with closing(get_db_connection()) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM download_tasks ORDER BY created_at ASC, rowid ASC")
+        rows = []
+        for row in cursor.fetchall():
+            item = dict(row)
+            try:
+                headers = json.loads(item.pop("custom_headers") or "null")
+            except Exception:
+                headers = None
+            try:
+                existing_files = json.loads(item.pop("existing_files") or "[]")
+            except Exception:
+                existing_files = []
+            try:
+                tracked_files = json.loads(item.pop("tracked_files") or "[]")
+            except Exception:
+                tracked_files = []
+            item["subtitles"] = bool(item.get("subtitles"))
+            item["download_playlist"] = bool(item.get("download_playlist"))
+            item["headers"] = headers if isinstance(headers, dict) else None
+            item["proxy"] = item.pop("proxy_url", None)
+            item["_video_id"] = item.pop("video_id", None)
+            item["_existing_files"] = existing_files if isinstance(existing_files, list) else []
+            item["_tracked_files"] = tracked_files if isinstance(tracked_files, list) else []
+            rows.append(item)
+        return rows
+
+
+def delete_download_task(task_id: str):
+    with closing(get_db_connection()) as conn, conn:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM download_tasks WHERE id = ?", (task_id,))
+        conn.commit()
+
+
+def clear_inactive_download_tasks():
+    with closing(get_db_connection()) as conn, conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            DELETE FROM download_tasks
+            WHERE status NOT IN ('downloading', 'pending', 'processing', 'paused', 'queued')
+        """)
+        conn.commit()
 

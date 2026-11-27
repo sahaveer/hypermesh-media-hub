@@ -5,6 +5,7 @@ import time
 import uuid
 import shutil
 import threading
+from threading import Thread
 import logging
 import pathlib
 import json
@@ -53,6 +54,20 @@ _download_tasks: Dict[str, Dict[str, Any]] = {}
 _active_processes: Dict[str, subprocess.Popen] = {}
 _worker_done_events: Dict[str, threading.Event] = {}
 _lock = threading.Lock()
+_last_persist_times: Dict[str, float] = {}
+_downloads_initialized = False
+
+_SOCIAL_MEDIA_HOSTS = (
+    "youtube.com", "youtu.be", "music.youtube.com",
+    "instagram.com", "tiktok.com", "vt.tiktok.com", "vm.tiktok.com",
+    "spotify.com", "soundcloud.com", "vimeo.com",
+    "x.com", "twitter.com", "facebook.com", "fb.watch", "twitch.tv",
+)
+_DIRECT_FILE_EXTENSIONS = {
+    ".mp3", ".m4a", ".aac", ".flac", ".ogg", ".opus", ".wav", ".wma",
+    ".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v", ".ts",
+    ".zip", ".apk", ".iso", ".bin", ".tar", ".gz", ".7z",
+}
 
 
 class _DownloadInterrupted(Exception):
@@ -61,6 +76,93 @@ class _DownloadInterrupted(Exception):
 
 def _public_task_copy(task: Dict[str, Any]) -> Dict[str, Any]:
     return {k: v for k, v in task.items() if not k.startswith("_")}
+
+
+def _persist_task(task: Optional[Dict[str, Any]], force: bool = False) -> None:
+    if not task or not task.get("id"):
+        return
+    task_id = str(task["id"])
+    now = time.monotonic()
+    if not force and (now - _last_persist_times.get(task_id, 0.0)) < 2.0:
+        return
+    _last_persist_times[task_id] = now
+    try:
+        import database
+        database.upsert_download_task(dict(task))
+    except Exception as err:
+        logger.debug(f"Could not persist download task {task_id}: {err}")
+
+
+def init_downloads() -> None:
+    """Hydrates download tasks from SQLite on server startup."""
+    global _downloads_initialized
+    try:
+        import database
+        rows = database.get_download_tasks()
+    except Exception as err:
+        logger.debug(f"Skipping download task hydration: {err}")
+        _downloads_initialized = True
+        return
+
+    with _lock:
+        for row in rows:
+            tid = row.get("id")
+            if not tid or tid in _download_tasks:
+                continue
+            if row.get("status") in ("pending", "downloading", "processing", "queued"):
+                row["status"] = "paused"
+                row["speed"] = 0
+                row["eta"] = None
+                if not row.get("error"):
+                    row["error"] = "Paused after server restart. Tap Resume to continue."
+                try:
+                    import database
+                    database.upsert_download_task(row)
+                except Exception:
+                    pass
+            _download_tasks[tid] = row
+        _downloads_initialized = True
+
+
+def _parse_timestamp_seconds(raw: Optional[str]) -> Optional[float]:
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if not text:
+        return None
+    if ":" in text:
+        parts = text.split(":")
+        if len(parts) > 3:
+            raise ValueError(f"Invalid timestamp '{text}'. Use seconds or MM:SS / HH:MM:SS.")
+        try:
+            total = 0.0
+            for part in parts:
+                total = total * 60.0 + float(part)
+            return max(0.0, total)
+        except ValueError as err:
+            raise ValueError(f"Invalid timestamp '{text}'.") from err
+    try:
+        return max(0.0, float(text))
+    except ValueError as err:
+        raise ValueError(f"Invalid timestamp '{text}'.") from err
+
+
+def _is_direct_http_candidate(url: str, clip_start: Optional[str] = None, clip_end: Optional[str] = None, subtitles: bool = False, download_playlist: bool = False) -> bool:
+    if clip_start or clip_end or subtitles or download_playlist:
+        return False
+    lower = url.strip().lower()
+    if not lower.startswith(("http://", "https://")):
+        return False
+    parsed = urllib.parse.urlparse(lower)
+    host = (parsed.hostname or "").lower()
+    if any(host == h or host.endswith("." + h) for h in _SOCIAL_MEDIA_HOSTS):
+        return False
+    ext = pathlib.Path(parsed.path).suffix.lower()
+    if ext in (".m3u8", ".mpd"):
+        return False
+    if ext in _DIRECT_FILE_EXTENSIONS:
+        return True
+    return False
 
 
 def _terminate_process(process: Optional[subprocess.Popen]) -> None:
@@ -283,18 +385,254 @@ def _progress_hook(d: Dict[str, Any], task_id: str):
         if d.get("status") == "downloading":
             total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
             downloaded = d.get("downloaded_bytes") or 0
+            task["downloaded_bytes"] = int(downloaded)
+            task["total_bytes"] = int(total)
             if total > 0:
                 percent = round((downloaded / total) * 100, 1)
                 task["progress"] = percent
             task["status"] = "downloading"
             task["speed"] = d.get("speed", 0)
             task["eta"] = d.get("eta", 0)
+            _persist_task(task, force=False)
 
         elif d.get("status") == "finished":
             task["status"] = "processing"
             task["progress"] = 100
             task["speed"] = 0
             task["eta"] = None
+            _persist_task(task, force=True)
+
+
+def _perform_chunked_http_download(
+    task_id: str,
+    url: str,
+    target_dir: pathlib.Path,
+    media_format: str,
+    destination: str,
+    owner_id: str,
+    owner_name: str,
+    target_playlist_id: Optional[str],
+    custom_headers: Optional[Dict[str, str]] = None,
+    proxy_url: Optional[str] = None,
+    rate_limit_kbps: int = 0,
+) -> bool:
+    """
+    Attempts a direct multi-threaded HTTP Range download writing directly into a single
+    pre-allocated .part file (no post-merge step). Returns True if handled, False to
+    fall back to yt-dlp.
+    """
+    req_headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    }
+    if custom_headers:
+        for k, v in custom_headers.items():
+            if k and v is not None:
+                req_headers[str(k)] = str(v)
+
+    opener = urllib.request.build_opener()
+    if proxy_url and str(proxy_url).strip():
+        p = str(proxy_url).strip()
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({"http": p, "https": p}))
+
+    try:
+        head_req = urllib.request.Request(url, method="HEAD", headers=req_headers)
+        with opener.open(head_req, timeout=15) as resp:
+            content_type = (resp.headers.get("Content-Type") or "").lower()
+            if "text/html" in content_type or "mpegurl" in content_type or "dash+xml" in content_type:
+                return False
+            content_length = int(resp.headers.get("Content-Length") or 0)
+            accept_ranges = "bytes" in (resp.headers.get("Accept-Ranges") or "").lower()
+            disposition = resp.headers.get("Content-Disposition") or ""
+    except Exception:
+        return False
+
+    if content_length <= 0:
+        return False
+
+    filename = ""
+    disp_match = re.search(r'filename\*?=(?:UTF-8\'\')?"?([^";\r\n]+)"?', disposition, re.IGNORECASE)
+    if disp_match:
+        filename = urllib.parse.unquote(disp_match.group(1).strip())
+    if not filename:
+        filename = pathlib.Path(urllib.parse.urlparse(url).path).name or f"download_{task_id[:8]}"
+    filename = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", filename).strip() or f"download_{task_id[:8]}"
+
+    target_dir.mkdir(parents=True, exist_ok=True)
+    final_path = target_dir / filename
+    part_path = target_dir / f"{filename}.part"
+    meta_path = target_dir / f"{filename}.part.meta.json"
+
+    with _lock:
+        task = _download_tasks.get(task_id)
+        if not task or task.get("status") in ("paused", "cancelled"):
+            raise _DownloadInterrupted("Paused or cancelled.")
+        task["title"] = pathlib.Path(filename).stem
+        task["total_bytes"] = content_length
+        task["status"] = "downloading"
+        _record_tracked_file(task, str(final_path))
+        _record_tracked_file(task, str(part_path))
+        _record_tracked_file(task, str(meta_path))
+        _persist_task(task, force=True)
+
+    num_chunks = 4 if (accept_ranges and content_length >= 2 * 1024 * 1024) else 1
+    ranges: List[List[int]] = []
+    if meta_path.exists() and part_path.exists() and part_path.stat().st_size == content_length:
+        try:
+            saved_meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            if saved_meta.get("total_bytes") == content_length and saved_meta.get("url") == url:
+                ranges = saved_meta.get("ranges") or []
+        except Exception:
+            ranges = []
+
+    if not ranges:
+        chunk_size = content_length // num_chunks
+        for i in range(num_chunks):
+            start = i * chunk_size
+            end = (content_length - 1) if i == num_chunks - 1 else ((i + 1) * chunk_size - 1)
+            ranges.append([start, end, start])  # [start, end, current_offset]
+        with open(part_path, "wb") as f:
+            f.truncate(content_length)
+        meta_path.write_text(json.dumps({"url": url, "total_bytes": content_length, "ranges": ranges}), encoding="utf-8")
+
+    file_lock = threading.Lock()
+    meta_lock = threading.Lock()
+    errors: List[Exception] = []
+    start_time = time.monotonic()
+    initial_done = sum(max(0, r[2] - r[0]) for r in ranges)
+
+    def _is_interrupted() -> bool:
+        with _lock:
+            cur = _download_tasks.get(task_id)
+            return not cur or cur.get("status") in ("paused", "cancelled")
+
+    def _save_meta():
+        with meta_lock:
+            try:
+                meta_path.write_text(json.dumps({"url": url, "total_bytes": content_length, "ranges": ranges}), encoding="utf-8")
+            except Exception:
+                pass
+
+    def _update_progress():
+        done_bytes = sum(max(0, r[2] - r[0]) for r in ranges)
+        elapsed = max(0.1, time.monotonic() - start_time)
+        speed = max(0.0, (done_bytes - initial_done) / elapsed)
+        remaining = max(0, content_length - done_bytes)
+        eta = int(remaining / speed) if speed > 0 else None
+        pct = round((done_bytes / content_length) * 100, 1) if content_length else 0.0
+        with _lock:
+            cur = _download_tasks.get(task_id)
+            if cur and cur.get("status") not in ("paused", "cancelled"):
+                cur["downloaded_bytes"] = done_bytes
+                cur["total_bytes"] = content_length
+                cur["progress"] = min(99.9, pct)
+                cur["speed"] = speed
+                cur["eta"] = eta
+                _persist_task(cur, force=False)
+
+    per_worker_rate = (rate_limit_kbps * 1024 / max(1, num_chunks)) if rate_limit_kbps > 0 else 0
+
+    def _download_range(idx: int):
+        r = ranges[idx]
+        if r[2] > r[1]:
+            return
+        headers = dict(req_headers)
+        if accept_ranges:
+            headers["Range"] = f"bytes={r[2]}-{r[1]}"
+        req = urllib.request.Request(url, headers=headers)
+        try:
+            with opener.open(req, timeout=30) as resp:
+                chunk_start_ts = time.monotonic()
+                bytes_since_ts = 0
+                with open(part_path, "r+b") as fh:
+                    while r[2] <= r[1]:
+                        if _is_interrupted():
+                            return
+                        to_read = min(65536, r[1] - r[2] + 1)
+                        buf = resp.read(to_read)
+                        if not buf:
+                            break
+                        with file_lock:
+                            fh.seek(r[2])
+                            fh.write(buf)
+                        r[2] += len(buf)
+                        bytes_since_ts += len(buf)
+                        if per_worker_rate > 0:
+                            expected = bytes_since_ts / per_worker_rate
+                            actual = time.monotonic() - chunk_start_ts
+                            if expected > actual:
+                                time.sleep(min(0.5, expected - actual))
+                        _update_progress()
+                        if bytes_since_ts >= 512 * 1024:
+                            _save_meta()
+                            bytes_since_ts = 0
+                            chunk_start_ts = time.monotonic()
+        except Exception as exc:
+            errors.append(exc)
+        finally:
+            _save_meta()
+
+    threads = [Thread(target=_download_range, args=(i,), daemon=True) for i in range(len(ranges))]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    if _is_interrupted():
+        raise _DownloadInterrupted("Paused or cancelled.")
+    if errors:
+        raise errors[0]
+
+    total_written = sum(max(0, r[2] - r[0]) for r in ranges)
+    if total_written < content_length:
+        raise RuntimeError(f"Incomplete download ({total_written}/{content_length} bytes).")
+
+    os.replace(part_path, final_path)
+    meta_path.unlink(missing_ok=True)
+
+    song_id = None
+    raw_title = final_path.stem
+    artist_name = ""
+    if destination == "server" and final_path.suffix.lower() in (config.AUDIO_EXTENSIONS | config.VIDEO_EXTENSIONS):
+        is_vid = final_path.suffix.lower() in config.VIDEO_EXTENSIONS
+        media_item = scanner.parse_media_file(
+            final_path,
+            folder_type="video" if is_vid else ("music" if media_format == "audio" else "video"),
+            owner_id=owner_id,
+            owner_name=owner_name,
+        )
+        if media_item:
+            import database
+            database.upsert_song(media_item)
+            song_id = media_item["id"]
+            raw_title = media_item["title"]
+            artist_name = media_item.get("artist", "")
+            if target_playlist_id and song_id:
+                try:
+                    database.add_song_to_playlist(target_playlist_id, song_id)
+                except Exception:
+                    pass
+
+    with _lock:
+        cur = _download_tasks.get(task_id)
+        if not cur or cur.get("status") in ("paused", "cancelled"):
+            return True
+        cur["title"] = raw_title
+        cur["artist"] = artist_name
+        cur["song_id"] = song_id
+        cur["file_path"] = str(final_path.resolve())
+        cur["download_url"] = f"/api/downloads/{task_id}/file" if destination == "client" else (f"/api/stream/{song_id}?download=true" if song_id else f"/api/downloads/{task_id}/file")
+        cur["status"] = "completed"
+        cur["progress"] = 100
+        cur["downloaded_bytes"] = content_length
+        cur["total_bytes"] = content_length
+        cur["speed"] = 0
+        cur["eta"] = 0
+        cur["error"] = None
+        _persist_task(cur, force=True)
+
+    if destination == "server":
+        Thread(target=scanner.scan_library, daemon=True).start()
+    return True
 
 def _perform_download(
     task_id: str,
@@ -306,11 +644,46 @@ def _perform_download(
     owner_id: str = "host",
     owner_name: str = "Host",
     cookies_browser: Optional[str] = None,
-    target_playlist_id: Optional[str] = None
+    target_playlist_id: Optional[str] = None,
+    clip_start: Optional[str] = None,
+    clip_end: Optional[str] = None,
+    subtitles: bool = False,
+    custom_headers: Optional[Dict[str, str]] = None,
+    proxy_url: Optional[str] = None,
 ):
     task = _download_tasks[task_id]
     target_dir.mkdir(parents=True, exist_ok=True)
     out_template = str(target_dir / "%(title).100B [%(id)s].%(ext)s")
+
+    current_settings = {}
+    try:
+        current_settings = settings.load_settings()
+    except Exception:
+        current_settings = {}
+    rate_limit_kbps = int(current_settings.get("download_rate_limit_kbps") or 0)
+
+    if _is_direct_http_candidate(raw_url, clip_start=clip_start, clip_end=clip_end, subtitles=subtitles, download_playlist=False):
+        try:
+            handled = _perform_chunked_http_download(
+                task_id=task_id,
+                url=raw_url,
+                target_dir=target_dir,
+                media_format=media_format,
+                destination=destination,
+                owner_id=owner_id,
+                owner_name=owner_name,
+                target_playlist_id=target_playlist_id,
+                custom_headers=custom_headers,
+                proxy_url=proxy_url,
+                rate_limit_kbps=rate_limit_kbps,
+            )
+            if handled:
+                return
+        except _DownloadInterrupted:
+            logger.info(f"Direct HTTP download task {task_id} interrupted.")
+            return
+        except Exception as direct_err:
+            logger.warning(f"Direct HTTP chunked download failed ({direct_err}), falling back to yt-dlp...")
 
     # Resolve URL (e.g. Spotify DRM -> YouTube search, plain query -> ytsearch1)
     target_url, resolved_hint = _resolve_media_url(raw_url)
@@ -336,6 +709,27 @@ def _perform_download(
         "playlistend": 1,
         "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
     }
+
+    if rate_limit_kbps > 0:
+        ydl_opts["ratelimit"] = rate_limit_kbps * 1024
+    if proxy_url and str(proxy_url).strip():
+        ydl_opts["proxy"] = str(proxy_url).strip()
+    if custom_headers:
+        ydl_opts["http_headers"] = {str(k): str(v) for k, v in custom_headers.items() if k and v is not None}
+
+    start_sec = _parse_timestamp_seconds(clip_start)
+    end_sec = _parse_timestamp_seconds(clip_end)
+    if start_sec is not None or end_sec is not None:
+        from yt_dlp.utils import download_range_func
+        s_val = start_sec if start_sec is not None else 0.0
+        e_val = end_sec if end_sec is not None else float("inf")
+        ydl_opts["download_ranges"] = download_range_func(None, [(s_val, e_val)])
+        ydl_opts["force_keyframes_at_cuts"] = True
+
+    if subtitles:
+        ydl_opts["writesubtitles"] = True
+        ydl_opts["writeautomaticsub"] = True
+        ydl_opts["subtitleslangs"] = ["en.*", "en"]
 
     # Browser cookies: unlocks login-gated Instagram reels/posts, age gates & bypasses bot checks
     if cookies_browser and str(cookies_browser).strip().lower() not in ("none", "off", "disabled", "false", ""):
@@ -370,14 +764,16 @@ def _perform_download(
             })
     else:
         # Video download
-        if quality == "1080p":
+        if quality in ("4k", "2160p"):
+            format_str = "bestvideo[height<=2160]+bestaudio/best[height<=2160]/best"
+        elif quality == "1080p":
             format_str = "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best"
         elif quality == "720p":
             format_str = "bestvideo[height<=720]+bestaudio/best[height<=720]/best"
         else:
             format_str = "bestvideo+bestaudio/best"
 
-        limit = "[height<=1080]" if quality == "1080p" else "[height<=720]" if quality == "720p" else ""
+        limit = "[height<=2160]" if quality in ("4k", "2160p") else "[height<=1080]" if quality == "1080p" else "[height<=720]" if quality == "720p" else ""
         if FFMPEG_PATH and os.path.exists(FFMPEG_PATH):
             format_str = f"bestvideo[ext=mp4][vcodec^=avc1]{limit}+bestaudio[ext=m4a]/best[ext=mp4]{limit}/" + format_str
         else:
@@ -388,7 +784,11 @@ def _perform_download(
             "merge_output_format": "mp4",
         })
         if FFMPEG_PATH and os.path.exists(FFMPEG_PATH):
-            ydl_opts["postprocessors"] = [{"key": "FFmpegMetadata"}]
+            postprocessors = []
+            if subtitles:
+                postprocessors.append({"key": "FFmpegEmbedSubtitle"})
+            postprocessors.append({"key": "FFmpegMetadata"})
+            ydl_opts["postprocessors"] = postprocessors
 
     def _locate_file(ydl_instance, entry_dict) -> Optional[pathlib.Path]:
         """Locates the final downloaded media file on disk."""
@@ -475,9 +875,10 @@ def _perform_download(
                 task["progress"] = 100
                 task["duration"] = entry.get("duration", 0)
                 task["error"] = None
+                _persist_task(task, force=True)
 
         if destination == "server":
-            threading.Thread(target=scanner.scan_library, daemon=True).start()
+            Thread(target=scanner.scan_library, daemon=True).start()
 
     except _DownloadInterrupted:
         logger.info(f"Download task {task_id} interrupted (paused or cancelled).")
@@ -574,9 +975,10 @@ def _perform_download(
                     task["progress"] = 100
                     task["duration"] = entry.get("duration", 0)
                     task["error"] = None
+                    _persist_task(task, force=True)
 
             if destination == "server":
-                threading.Thread(target=scanner.scan_library, daemon=True).start()
+                Thread(target=scanner.scan_library, daemon=True).start()
 
         except _DownloadInterrupted:
             logger.info(f"Download task {task_id} interrupted during fallback (paused or cancelled).")
@@ -602,6 +1004,52 @@ def _perform_download(
                     task["error"] = clean_err
                     if task["title"] == "Fetching metadata...":
                         task["title"] = resolved_hint or raw_url.split("?")[0].split("/")[-1] or "Download Failed"
+                    _persist_task(task, force=True)
+
+def _active_worker_count_locked() -> int:
+    return sum(
+        1 for t in _download_tasks.values()
+        if t.get("status") in ("pending", "downloading", "processing")
+    )
+
+
+def _max_concurrent_downloads() -> int:
+    try:
+        val = int(settings.load_settings().get("max_concurrent_downloads") or 2)
+        return max(1, min(10, val))
+    except Exception:
+        return 2
+
+
+def _dispatch_queued_downloads() -> None:
+    to_launch: List[Tuple[Any, ...]] = []
+    max_conc = _max_concurrent_downloads()
+    with _lock:
+        active = _active_worker_count_locked()
+        if active >= max_conc:
+            return
+        queued = [t for t in _download_tasks.values() if t.get("status") == "queued"]
+        for task in queued:
+            if active >= max_conc:
+                break
+            task["status"] = "pending"
+            task["error"] = None
+            _persist_task(task, force=True)
+            to_launch.append((
+                task["id"],
+                task["url"],
+                task["format"],
+                task["quality"],
+                pathlib.Path(task["target_dir"]),
+                task.get("destination", "server"),
+                task.get("owner_id", "host"),
+                task.get("owner_name", "Host"),
+                task.get("cookies_browser"),
+            ))
+            active += 1
+    for args in to_launch:
+        Thread(target=_run_download, args=args, daemon=True).start()
+
 
 def _run_download(task_id, raw_url, media_format, quality, target_dir, destination="server", owner_id="host", owner_name="Host", cookies_browser=None):
     """Supervise an isolated worker so extractor hangs cannot leave pending tasks."""
@@ -614,14 +1062,24 @@ def _run_download(task_id, raw_url, media_format, quality, target_dir, destinati
             done_event.set()
             return
         target_playlist_id = task_ref.get("target_playlist_id")
+        clip_start = task_ref.get("clip_start")
+        clip_end = task_ref.get("clip_end")
+        subtitles = bool(task_ref.get("subtitles"))
+        custom_headers = task_ref.get("headers")
+        proxy_url = task_ref.get("proxy")
     def fail(message):
         with _lock:
             task = _download_tasks.get(task_id)
             if task and task.get("status") not in ("paused", "cancelled", "completed"):
                 task.update(status="failed", error=message, title=task.get("title") or raw_url)
+                _persist_task(task, force=True)
     try:
         if getattr(sys, "frozen", False):
-            _perform_download(task_id, raw_url, media_format, quality, target_dir, destination, owner_id, owner_name, cookies_browser, target_playlist_id)
+            _perform_download(
+                task_id, raw_url, media_format, quality, target_dir, destination,
+                owner_id, owner_name, cookies_browser, target_playlist_id,
+                clip_start, clip_end, subtitles, custom_headers, proxy_url,
+            )
             return
         with _lock:
             task_ref = _download_tasks.get(task_id)
@@ -653,9 +1111,10 @@ def _run_download(task_id, raw_url, media_format, quality, target_dir, destinati
                         cur = _download_tasks.get(task_id)
                         if cur and cur["status"] not in ("failed", "completed", "paused", "cancelled"):
                             cur.update(update)
+                            _persist_task(cur, force=cur.get("status") in ("completed", "failed"))
                 except (ValueError, TypeError):
                     continue
-        reader = threading.Thread(target=read_updates, daemon=True)
+        reader = Thread(target=read_updates, daemon=True)
         reader.start()
         started = time.monotonic()
         while process.poll() is None:
@@ -690,6 +1149,7 @@ def _run_download(task_id, raw_url, media_format, quality, target_dir, destinati
                 except Exception:
                     pass
         done_event.set()
+        _dispatch_queued_downloads()
 
 
 def _download_worker():
@@ -703,7 +1163,7 @@ def _download_worker():
     def report():
         while not done.wait(0.5):
             emit()
-    threading.Thread(target=report, daemon=True).start()
+    Thread(target=report, daemon=True).start()
     try:
         _perform_download(
             task_id,
@@ -715,7 +1175,12 @@ def _download_worker():
             task["owner_id"],
             task["owner_name"],
             task.get("cookies_browser"),
-            task.get("target_playlist_id")
+            task.get("target_playlist_id"),
+            task.get("clip_start"),
+            task.get("clip_end"),
+            bool(task.get("subtitles")),
+            task.get("headers"),
+            task.get("proxy"),
         )
     except Exception as error:
         with _lock:
@@ -723,6 +1188,98 @@ def _download_worker():
     finally:
         done.set()
         emit()
+
+
+def _expand_playlist_and_enqueue(
+    parent_task_id: str,
+    url: str,
+    media_format: str,
+    quality: str,
+    destination: str,
+    custom_folder: Optional[str],
+    owner_id: str,
+    owner_name: str,
+    cookies_browser: Optional[str],
+    target_playlist_id: Optional[str],
+    subtitles: bool,
+    headers: Optional[Dict[str, str]],
+    proxy: Optional[str],
+):
+    try:
+        ydl_opts: Dict[str, Any] = {
+            "quiet": True,
+            "no_warnings": True,
+            "extract_flat": "in_playlist",
+            "skip_download": True,
+            "socket_timeout": 20,
+            "playlistend": 50,
+            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        }
+        if proxy:
+            ydl_opts["proxy"] = proxy
+        if headers:
+            ydl_opts["http_headers"] = headers
+        if cookies_browser:
+            ydl_opts["cookiesfrombrowser"] = (cookies_browser,)
+
+        entry_urls: List[str] = []
+        playlist_title = ""
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            if info:
+                playlist_title = str(info.get("title") or "").strip()
+                raw_entries = info.get("entries")
+                if raw_entries:
+                    for entry in raw_entries:
+                        if not entry:
+                            continue
+                        vid_id = str(entry.get("id") or "").strip()
+                        e_url = str(entry.get("webpage_url") or entry.get("url") or "").strip()
+                        if e_url and not e_url.startswith(("http://", "https://")) and vid_id:
+                            e_url = f"https://www.youtube.com/watch?v={vid_id}"
+                        elif not e_url and vid_id:
+                            e_url = f"https://www.youtube.com/watch?v={vid_id}"
+                        if e_url:
+                            entry_urls.append(e_url)
+                        if len(entry_urls) >= 50:
+                            break
+
+        if not entry_urls:
+            entry_urls = [url]
+
+        for entry_url in entry_urls:
+            start_download(
+                url=entry_url,
+                media_format=media_format,
+                quality=quality,
+                destination=destination,
+                custom_folder=custom_folder,
+                owner_id=owner_id,
+                owner_name=owner_name,
+                cookies_browser=cookies_browser,
+                target_playlist_id=target_playlist_id,
+                subtitles=subtitles,
+                download_playlist=False,
+                headers=headers,
+                proxy=proxy,
+            )
+
+        with _lock:
+            parent = _download_tasks.get(parent_task_id)
+            if parent:
+                label = f"{playlist_title}: " if playlist_title else ""
+                parent["title"] = f"{label}Queued {len(entry_urls)} playlist items"
+                parent["status"] = "completed"
+                parent["progress"] = 100
+                parent["error"] = None
+                _persist_task(parent, force=True)
+    except Exception as err:
+        with _lock:
+            parent = _download_tasks.get(parent_task_id)
+            if parent:
+                parent["status"] = "failed"
+                parent["error"] = f"Playlist extraction failed: {err}"
+                _persist_task(parent, force=True)
 
 
 def start_download(
@@ -734,7 +1291,13 @@ def start_download(
     owner_id: str = "host",
     owner_name: str = "Host",
     cookies_browser: Optional[str] = None,
-    target_playlist_id: Optional[str] = None
+    target_playlist_id: Optional[str] = None,
+    clip_start: Optional[str] = None,
+    clip_end: Optional[str] = None,
+    subtitles: bool = False,
+    download_playlist: bool = False,
+    headers: Optional[Dict[str, str]] = None,
+    proxy: Optional[str] = None,
 ) -> str:
     """
     Enqueues a download task in background and returns task_id.
@@ -743,8 +1306,10 @@ def start_download(
     """
     if media_format not in ("audio", "video") or destination not in ("server", "client"):
         raise ValueError("Choose Audio or Video and a valid download destination.")
+    _parse_timestamp_seconds(clip_start)
+    _parse_timestamp_seconds(clip_end)
+
     task_id = str(uuid.uuid4())
-    
     current_settings = settings.load_settings()
     if destination == "client":
         target_dir = config.STAGING_DIR / f"client_{task_id}"
@@ -762,6 +1327,50 @@ def start_download(
     else:
         active_cookies_browser = None
 
+    clean_headers = {str(k): str(v) for k, v in headers.items() if k and v is not None} if headers else None
+    clean_proxy = proxy.strip() if isinstance(proxy, str) and proxy.strip() else None
+    clean_clip_start = clip_start.strip() if isinstance(clip_start, str) and clip_start.strip() else None
+    clean_clip_end = clip_end.strip() if isinstance(clip_end, str) and clip_end.strip() else None
+
+    if download_playlist:
+        with _lock:
+            _download_tasks[task_id] = {
+                "id": task_id,
+                "url": url,
+                "title": "Expanding playlist...",
+                "format": media_format,
+                "quality": quality,
+                "destination": destination,
+                "owner_id": owner_id,
+                "owner_name": owner_name,
+                "cookies_browser": active_cookies_browser,
+                "target_playlist_id": target_playlist_id,
+                "status": "pending",
+                "progress": 0,
+                "speed": 0,
+                "eta": None,
+                "downloaded_bytes": 0,
+                "total_bytes": 0,
+                "target_dir": str(target_dir),
+                "error": None,
+                "download_playlist": True,
+                "created_at": time.time(),
+                "_existing_files": [],
+                "_tracked_files": [],
+                "_video_id": None,
+            }
+            _persist_task(_download_tasks[task_id], force=True)
+        Thread(
+            target=_expand_playlist_and_enqueue,
+            args=(
+                task_id, url, media_format, quality, destination, custom_folder,
+                owner_id, owner_name, active_cookies_browser, target_playlist_id,
+                bool(subtitles), clean_headers, clean_proxy,
+            ),
+            daemon=True,
+        ).start()
+        return task_id
+
     existing_files: List[str] = []
     if destination == "server" and target_dir.exists() and target_dir.is_dir():
         try:
@@ -769,7 +1378,11 @@ def start_download(
         except Exception:
             existing_files = []
 
+    max_conc = max(1, min(10, int(current_settings.get("max_concurrent_downloads") or 2)))
+    should_queue = False
     with _lock:
+        if _active_worker_count_locked() >= max_conc:
+            should_queue = True
         _download_tasks[task_id] = {
             "id": task_id,
             "url": url,
@@ -781,23 +1394,34 @@ def start_download(
             "owner_name": owner_name,
             "cookies_browser": active_cookies_browser,
             "target_playlist_id": target_playlist_id,
-            "status": "pending",
+            "status": "queued" if should_queue else "pending",
             "progress": 0,
             "speed": 0,
             "eta": None,
+            "downloaded_bytes": 0,
+            "total_bytes": 0,
             "target_dir": str(target_dir),
             "error": None,
+            "clip_start": clean_clip_start,
+            "clip_end": clean_clip_end,
+            "subtitles": bool(subtitles),
+            "download_playlist": False,
+            "headers": clean_headers,
+            "proxy": clean_proxy,
+            "created_at": time.time(),
             "_existing_files": existing_files,
             "_tracked_files": [],
             "_video_id": None,
         }
+        _persist_task(_download_tasks[task_id], force=True)
 
-    thread = threading.Thread(
-        target=_run_download,
-        args=(task_id, url, media_format, quality, target_dir, destination, owner_id, owner_name, active_cookies_browser),
-        daemon=True
-    )
-    thread.start()
+    if not should_queue:
+        thread = Thread(
+            target=_run_download,
+            args=(task_id, url, media_format, quality, target_dir, destination, owner_id, owner_name, active_cookies_browser),
+            daemon=True
+        )
+        thread.start()
     return task_id
 
 
@@ -815,6 +1439,7 @@ def pause_download(task_id: str) -> Dict[str, Any]:
         task["status"] = "paused"
         task["speed"] = 0
         task["eta"] = None
+        _persist_task(task, force=True)
         proc = _active_processes.get(task_id)
         done_event = _worker_done_events.get(task_id)
         result = _public_task_copy(task)
@@ -822,32 +1447,38 @@ def pause_download(task_id: str) -> Dict[str, Any]:
     _terminate_process(proc)
     if done_event:
         done_event.wait(timeout=3)
+    _dispatch_queued_downloads()
     return result
 
 
 def resume_download(task_id: str) -> Dict[str, Any]:
-    """Resumes a paused download task from partial files."""
+    """Resumes a paused or failed download task from partial files."""
     with _lock:
         task = _download_tasks.get(task_id)
         if not task:
             raise KeyError("Download task not found.")
-        if task.get("status") != "paused":
-            raise ValueError("Only paused downloads can be resumed.")
+        if task.get("status") not in ("paused", "failed"):
+            raise ValueError("Only paused or failed downloads can be resumed.")
         done_event = _worker_done_events.get(task_id)
 
     if done_event:
         done_event.wait(timeout=3)
 
+    max_conc = _max_concurrent_downloads()
+    should_queue = False
     with _lock:
         task = _download_tasks.get(task_id)
         if not task:
             raise KeyError("Download task not found.")
-        if task.get("status") != "paused":
-            raise ValueError("Only paused downloads can be resumed.")
-        task["status"] = "pending"
+        if task.get("status") not in ("paused", "failed"):
+            raise ValueError("Only paused or failed downloads can be resumed.")
+        if _active_worker_count_locked() >= max_conc:
+            should_queue = True
+        task["status"] = "queued" if should_queue else "pending"
         task["error"] = None
         task["speed"] = 0
         task["eta"] = None
+        _persist_task(task, force=True)
         args = (
             task_id,
             task["url"],
@@ -861,8 +1492,32 @@ def resume_download(task_id: str) -> Dict[str, Any]:
         )
         result = _public_task_copy(task)
 
-    threading.Thread(target=_run_download, args=args, daemon=True).start()
+    if not should_queue:
+        Thread(target=_run_download, args=args, daemon=True).start()
     return result
+
+
+def edit_download(
+    task_id: str,
+    url: Optional[str] = None,
+    headers: Optional[Dict[str, str]] = None,
+    proxy: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Updates URL, custom headers, or proxy on a paused, failed, or queued download task."""
+    with _lock:
+        task = _download_tasks.get(task_id)
+        if not task:
+            raise KeyError("Download task not found.")
+        if task.get("status") not in ("paused", "failed", "queued"):
+            raise ValueError("Pause the download before editing its URL, headers, or proxy.")
+        if url is not None and url.strip():
+            task["url"] = url.strip()
+        if headers is not None:
+            task["headers"] = {str(k): str(v) for k, v in headers.items() if k and v is not None} or None
+        if proxy is not None:
+            task["proxy"] = proxy.strip() or None
+        _persist_task(task, force=True)
+        return _public_task_copy(task)
 
 
 def delete_download(task_id: str) -> bool:
@@ -882,6 +1537,12 @@ def delete_download(task_id: str) -> bool:
 
     if not was_completed or task.get("destination") == "client":
         _cleanup_partial_files(task)
+    try:
+        import database
+        database.delete_download_task(task_id)
+    except Exception:
+        pass
+    _dispatch_queued_downloads()
     return True
 
 def search_youtube(query: str, limit: int = 8) -> List[Dict[str, Any]]:
@@ -959,8 +1620,13 @@ def clear_downloads() -> None:
         global _download_tasks
         _download_tasks = {
             tid: t for tid, t in _download_tasks.items()
-            if t.get("status") in ("downloading", "pending", "processing", "paused")
+            if t.get("status") in ("downloading", "pending", "processing", "paused", "queued")
         }
+    try:
+        import database
+        database.clear_inactive_download_tasks()
+    except Exception:
+        pass
 
 
 if __name__ == "__main__" and "--download-worker" in sys.argv:

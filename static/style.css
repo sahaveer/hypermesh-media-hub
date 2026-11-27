@@ -269,13 +269,14 @@ body {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  flex-wrap: wrap;
   padding: 14px 24px;
   background: rgba(12, 14, 20, 0.85);
   backdrop-filter: blur(12px);
   -webkit-backdrop-filter: blur(12px);
   border-bottom: 1px solid var(--border-subtle);
   z-index: 5;
-  gap: 16px;
+  gap: 12px 16px;
 }
 
 .search-box {
@@ -287,7 +288,8 @@ body {
   border-radius: var(--radius-full);
   padding: 8px 16px;
   max-width: 440px;
-  flex: 1;
+  min-width: 180px;
+  flex: 1 1 220px;
   color: var(--text-muted);
 }
 
@@ -318,6 +320,7 @@ body {
 .top-actions {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 12px;
 }
 

@@ -51,6 +51,8 @@ def get_default_settings() -> Dict[str, Any]:
         "admin_token": "",  # Optional custom admin token / password for remote admin access
         "download_dir": default_download,
         "download_browser_cookies": "",  # Optional default browser session cookies ("chrome", "edge", "firefox", or "")
+        "max_concurrent_downloads": 2,
+        "download_rate_limit_kbps": 0,  # 0 = unlimited
         "apk_github_repo": "sahaveer/hypermesh-mobile-app",
         "apk_github_token": "",
         "shared_folders": shared_folders
@@ -89,6 +91,10 @@ def load_settings() -> Dict[str, Any]:
                 data["download_dir"] = str(config.DEFAULT_MUSIC_DIR)
             if "download_browser_cookies" not in data:
                 data["download_browser_cookies"] = ""
+            if "max_concurrent_downloads" not in data:
+                data["max_concurrent_downloads"] = 2
+            if "download_rate_limit_kbps" not in data:
+                data["download_rate_limit_kbps"] = 0
             if "apk_github_repo" not in data:
                 data["apk_github_repo"] = "sahaveer/hypermesh-mobile-app"
             if "apk_github_token" not in data:

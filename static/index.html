@@ -11,7 +11,7 @@
   <link rel="manifest" href="/manifest.json">
   <link rel="icon" type="image/svg+xml" href="/icon.svg">
   <link rel="apple-touch-icon" href="/icon.svg">
-  <link rel="stylesheet" href="/style.css?v=2.5">
+  <link rel="stylesheet" href="/style.css?v=2.6">
 </head>
 <body>
   <div class="app-layout">
@@ -661,6 +661,7 @@
 
               <select id="dl-quality-select" class="dropdown" title="Download Quality">
                 <option value="best">Best Quality</option>
+                <option value="4k">4K (2160p)</option>
                 <option value="1080p">1080p HD</option>
                 <option value="720p">720p HD</option>
               </select>
@@ -702,6 +703,22 @@
                 </button>
               </div>
             </div>
+            <details id="dl-advanced-details" style="margin-top: 10px; padding: 8px 12px; border-radius: 10px; background: rgba(255,255,255,0.03); border: 1px solid var(--border-subtle);">
+              <summary style="cursor: pointer; font-size: 0.82rem; font-weight: 600; color: var(--text-secondary);">⚙️ Advanced Options (Playlist, Clip Trim, Subtitles, Proxy)</summary>
+              <div style="display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-top: 10px;">
+                <label style="display: inline-flex; align-items: center; gap: 6px; font-size: 0.82rem; cursor: pointer;">
+                  <input type="checkbox" id="dl-playlist-checkbox">
+                  <span>Download Playlist (up to 50)</span>
+                </label>
+                <label style="display: inline-flex; align-items: center; gap: 6px; font-size: 0.82rem; cursor: pointer;">
+                  <input type="checkbox" id="dl-subtitles-checkbox">
+                  <span>Subtitles (EN)</span>
+                </label>
+                <input type="text" id="dl-clip-start" placeholder="Clip start (e.g. 0:30)" style="width: 145px; padding: 6px 10px; font-size: 0.8rem; border-radius: 8px; border: 1px solid var(--border-subtle); background: var(--bg-surface); color: var(--text-primary);">
+                <input type="text" id="dl-clip-end" placeholder="Clip end (e.g. 1:45)" style="width: 145px; padding: 6px 10px; font-size: 0.8rem; border-radius: 8px; border: 1px solid var(--border-subtle); background: var(--bg-surface); color: var(--text-primary);">
+                <input type="text" id="dl-proxy-input" placeholder="Optional proxy (http://host:port)" style="min-width: 210px; flex: 1; padding: 6px 10px; font-size: 0.8rem; border-radius: 8px; border: 1px solid var(--border-subtle); background: var(--bg-surface); color: var(--text-primary);">
+              </div>
+            </details>
             <p style="font-size: 0.78rem; color: var(--text-muted); margin-top: 8px;">
               💡 Paste a link to <strong>Download</strong> directly, or type a song/movie name to <strong>Search</strong> your server &amp; YouTube first. Use <strong>Cookies: Chrome/Edge</strong> for login-gated Instagram reels or age-restricted videos.
             </p>
@@ -830,6 +847,25 @@
                 <input type="checkbox" id="approval-queue-toggle">
                 <span class="slider round"></span>
               </label>
+            </div>
+
+            <!-- Downloader Concurrency & Rate Limit -->
+            <div class="setting-row" style="border-top: 1px solid var(--border-subtle); padding-top: 16px; margin-top: 16px;">
+              <div class="setting-info">
+                <h3>Downloader Queue &amp; Bandwidth Limit</h3>
+                <p>Control how many downloads run at once and optionally cap download speed (KB/s, 0 = unlimited).</p>
+              </div>
+              <div class="inline-edit" style="flex-wrap: wrap;">
+                <select id="max-concurrent-downloads-select" class="dropdown" style="width: auto;" title="Max concurrent downloads">
+                  <option value="1">1 active</option>
+                  <option value="2" selected>2 active</option>
+                  <option value="3">3 active</option>
+                  <option value="4">4 active</option>
+                  <option value="5">5 active</option>
+                </select>
+                <input type="number" id="download-rate-limit-input" min="0" step="128" placeholder="0 KB/s (Unlimited)" style="width: 155px;" title="Speed limit in KB/s (0 = unlimited)">
+                <button id="save-downloader-settings-btn" class="secondary-btn">Save</button>
+              </div>
             </div>
           </div>
 
@@ -2087,6 +2123,6 @@
   <input type="file" id="local-playback-input" multiple accept="audio/*,video/*,.mp3,.flac,.m4a,.wav,.mp4,.mkv,.webm,.mov" style="display: none;">
   <input type="file" id="photo-upload-input" multiple accept="image/*,.jpg,.jpeg,.png,.webp,.heic,.gif,.bmp" style="display: none;">
 
-  <script src="/app.js?v=2.5"></script>
+  <script src="/app.js?v=2.6"></script>
 </body>
 </html>

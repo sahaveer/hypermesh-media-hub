@@ -56,6 +56,7 @@ def run_status_auto_prune():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     database.init_db()
+    downloader.init_downloads()
     # Trigger initial library scan
     threading.Thread(target=scanner.scan_library, daemon=True).start()
     # Start Zeroconf peer discovery broadcast (Mesh Network)
@@ -146,6 +147,8 @@ class UpdateSettingsRequest(BaseModel):
     trust_tailscale_admin: Optional[bool] = None
     admin_token: Optional[str] = None
     download_browser_cookies: Optional[str] = None
+    max_concurrent_downloads: Optional[int] = None
+    download_rate_limit_kbps: Optional[int] = None
     apk_github_repo: Optional[str] = None
     apk_github_token: Optional[str] = None
 
@@ -162,13 +165,25 @@ class AddFolderRequest(BaseModel):
 class DownloadMediaRequest(BaseModel):
     url: str
     format: str = "audio"  # "audio" or "video"
-    quality: str = "best"   # "best", "1080p", "720p"
+    quality: str = "best"   # "best", "4k", "1080p", "720p"
     destination: str = "server"  # "server" or "client"
     custom_folder: Optional[str] = None
     client_id: Optional[str] = None
     device_name: Optional[str] = None
     cookies_browser: Optional[str] = None
     target_playlist_id: Optional[str] = None
+    clip_start: Optional[str] = None
+    clip_end: Optional[str] = None
+    subtitles: bool = False
+    download_playlist: bool = False
+    headers: Optional[Dict[str, str]] = None
+    proxy: Optional[str] = None
+
+
+class UpdateDownloadTaskRequest(BaseModel):
+    url: Optional[str] = None
+    headers: Optional[Dict[str, str]] = None
+    proxy: Optional[str] = None
 
 class ClientPingRequest(BaseModel):
     client_id: str
@@ -603,6 +618,10 @@ def update_settings(body: UpdateSettingsRequest, request: Request):
         current["admin_token"] = body.admin_token.strip()
     if body.download_browser_cookies is not None:
         current["download_browser_cookies"] = body.download_browser_cookies.strip().lower()
+    if body.max_concurrent_downloads is not None:
+        current["max_concurrent_downloads"] = max(1, min(10, int(body.max_concurrent_downloads)))
+    if body.download_rate_limit_kbps is not None:
+        current["download_rate_limit_kbps"] = max(0, int(body.download_rate_limit_kbps))
     if body.apk_github_repo is not None:
         current["apk_github_repo"] = body.apk_github_repo.strip()
     if body.apk_github_token is not None:
@@ -1310,11 +1329,33 @@ def enqueue_download(body: DownloadMediaRequest, request: Request):
             destination=body.destination or "server", custom_folder=body.custom_folder,
             owner_id=cid, owner_name=dname,
             cookies_browser=body.cookies_browser,
-            target_playlist_id=body.target_playlist_id
+            target_playlist_id=body.target_playlist_id,
+            clip_start=body.clip_start,
+            clip_end=body.clip_end,
+            subtitles=body.subtitles,
+            download_playlist=body.download_playlist,
+            headers=body.headers,
+            proxy=body.proxy,
         )
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error))
     return {"task_id": task_id, "destination": body.destination or "server", "message": "Download started in background"}
+
+
+@app.patch("/api/downloads/{task_id}")
+def edit_download_task(task_id: str, body: UpdateDownloadTaskRequest):
+    try:
+        task = downloader.edit_download(
+            task_id,
+            url=body.url,
+            headers=body.headers,
+            proxy=body.proxy,
+        )
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Download task not found")
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error))
+    return {"message": "Download task updated", "task": task, "tasks": downloader.get_download_status()}
 
 @app.get("/api/downloads/status")
 def get_downloads():
@@ -2313,9 +2354,20 @@ def get_tv_page():
         return FileResponse(str(tv_file), media_type="text/html")
     return RedirectResponse(url="/")
 
-# Mount Static Web App Frontend
+# Mount Static Web App Frontend (prevent stale HTML/ServiceWorker shell caching)
 static_dir = config.BASE_DIR / "static"
 static_dir.mkdir(exist_ok=True)
+_NO_CACHE_HEADERS = {"Cache-Control": "no-cache, no-store, must-revalidate", "Pragma": "no-cache"}
+
+@app.get("/")
+@app.get("/index.html")
+def serve_shell_index():
+    return FileResponse(str(static_dir / "index.html"), media_type="text/html", headers=_NO_CACHE_HEADERS)
+
+@app.get("/sw.js")
+def serve_service_worker():
+    return FileResponse(str(static_dir / "sw.js"), media_type="application/javascript", headers=_NO_CACHE_HEADERS)
+
 app.mount("/", StaticFiles(directory=str(static_dir), html=True), name="static")
 
 if __name__ == "__main__":

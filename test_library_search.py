@@ -11,14 +11,17 @@ import main
 
 class LibrarySearchTests(unittest.TestCase):
     def setUp(self):
-        self.temp_dir = tempfile.TemporaryDirectory(dir=config.DATA_DIR)
+        self.temp_dir = tempfile.TemporaryDirectory(dir=config.DATA_DIR, ignore_cleanup_errors=True)
         self.db_path = pathlib.Path(self.temp_dir.name) / "test_library_search.db"
-        self.orig_db = config.DB_PATH
+        self.orig_config_db = config.DB_PATH
+        self.orig_database_db = database.DB_PATH
         config.DB_PATH = self.db_path
+        database.DB_PATH = self.db_path
         database.init_db()
 
     def tearDown(self):
-        config.DB_PATH = self.orig_db
+        config.DB_PATH = self.orig_config_db
+        database.DB_PATH = self.orig_database_db
         self.temp_dir.cleanup()
 
     def test_audio_and_video_api_query_filters_available_files(self):
@@ -82,11 +85,18 @@ class LibrarySearchTests(unittest.TestCase):
         self.assertEqual([v["id"] for v in video_items], ["vid-1"])
 
     def test_webapp_has_dedicated_audio_and_video_search_bars(self):
-        html = (config.BASE_DIR / "static" / "index.html").read_text(encoding="utf-8")
-        self.assertIn('id="songs-search-input"', html)
-        self.assertIn('id="songs-clear-search"', html)
-        self.assertIn('id="videos-search-input"', html)
-        self.assertIn('id="videos-clear-search"', html)
+        client = TestClient(main.app)
+        root_res = client.get("/")
+        self.assertEqual(root_res.status_code, 200)
+        self.assertIn("no-cache", root_res.headers.get("cache-control", "").lower())
+        self.assertIn('id="songs-search-input"', root_res.text)
+        self.assertIn('id="songs-clear-search"', root_res.text)
+        self.assertIn('id="videos-search-input"', root_res.text)
+        self.assertIn('id="videos-clear-search"', root_res.text)
+
+        sw_res = client.get("/sw.js")
+        self.assertEqual(sw_res.status_code, 200)
+        self.assertIn("no-cache", sw_res.headers.get("cache-control", "").lower())
 
 
 if __name__ == "__main__":
