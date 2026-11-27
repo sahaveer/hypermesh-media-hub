@@ -305,6 +305,16 @@ body {
   width: 100%;
 }
 
+.section-search-bar {
+  margin-bottom: 14px;
+}
+
+.section-search-box {
+  max-width: 520px;
+  width: 100%;
+  flex: none;
+}
+
 .top-actions {
   display: flex;
   align-items: center;

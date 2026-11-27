@@ -3,6 +3,8 @@ const state = {
   allSongs: [],
   filteredSongs: [],
   videos: [],
+  songsSearchQuery: '',
+  videosSearchQuery: '',
   videoCategory: 'all',
   videoDecade: '',
   videoResolution: '',
@@ -158,6 +160,10 @@ const downloadsQueueEl = document.getElementById('downloads-queue');
 
 const searchInput = document.getElementById('search-input');
 const clearSearchBtn = document.getElementById('clear-search');
+const songsSearchInput = document.getElementById('songs-search-input');
+const songsClearSearchBtn = document.getElementById('songs-clear-search');
+const videosSearchInput = document.getElementById('videos-search-input');
+const videosClearSearchBtn = document.getElementById('videos-clear-search');
 const sortSelect = document.getElementById('sort-select');
 const serverBadge = document.getElementById('server-badge');
 const brandDeviceName = document.getElementById('brand-device-name');
@@ -486,10 +492,21 @@ function updateNetworkModeUI() {
   updateGlobalModalPanel();
 }
 
-async function fetchSongs(query = '', sortBy = 'title', scope = null, genre = null, language = null, year = null, decade = null) {
+function getActiveSongsQuery() {
+  if (songsSearchInput) return songsSearchInput.value.trim();
+  return state.songsSearchQuery || '';
+}
+
+function getActiveVideosQuery() {
+  if (videosSearchInput) return videosSearchInput.value.trim();
+  return state.videosSearchQuery || '';
+}
+
+async function fetchSongs(query = null, sortBy = 'title', scope = null, genre = null, language = null, year = null, decade = null) {
   try {
+    const resolvedQuery = (query !== null && query !== undefined) ? String(query).trim() : getActiveSongsQuery();
     const activeScope = scope || state.mediaScope || 'all';
-    let url = `/api/songs?query=${encodeURIComponent(query)}&sort_by=${sortBy}&scope=${activeScope}`;
+    let url = `/api/songs?query=${encodeURIComponent(resolvedQuery)}&sort_by=${sortBy}&scope=${activeScope}`;
     const activeGenre = genre !== null ? genre : state.selectedGenre;
     const activeLang = language !== null ? language : state.selectedLanguage;
     const activeYear = year !== null ? year : state.selectedYear;
@@ -528,9 +545,9 @@ async function fetchSongs(query = '', sortBy = 'title', scope = null, genre = nu
           liveShares = liveShares.filter(s => s.client_id === targetPeer);
         }
 
-        if (query) {
-          const q = query.toLowerCase();
-          liveShares = liveShares.filter(s => (s.title || '').toLowerCase().includes(q));
+        if (resolvedQuery) {
+          const q = resolvedQuery.toLowerCase();
+          liveShares = liveShares.filter(s => (s.title || '').toLowerCase().includes(q) || (s.owner_name || '').toLowerCase().includes(q));
         }
 
         songs = [...liveShares, ...songs];
@@ -550,14 +567,15 @@ async function fetchSongs(query = '', sortBy = 'title', scope = null, genre = nu
   }
 }
 
-async function fetchVideos(query = '', scope = null) {
+async function fetchVideos(query = null, scope = null) {
   try {
+    const resolvedQuery = (query !== null && query !== undefined) ? String(query).trim() : getActiveVideosQuery();
     const activeScope = scope || state.mediaScope || 'all';
     const cat = state.videoCategory || 'all';
     const decade = state.videoDecade || '';
     const resFilter = state.videoResolution || '';
     const sortBy = state.videoSort || 'title';
-    let url = `/api/videos?query=${encodeURIComponent(query)}&scope=${activeScope}&sort_by=${sortBy}`;
+    let url = `/api/videos?query=${encodeURIComponent(resolvedQuery)}&scope=${activeScope}&sort_by=${sortBy}`;
     if (cat !== 'all') url += `&category=${cat}`;
     if (decade) url += `&decade=${decade}`;
     if (resFilter) url += `&resolution=${encodeURIComponent(resFilter)}`;
@@ -584,9 +602,9 @@ async function fetchVideos(query = '', scope = null) {
           liveShares = liveShares.filter(s => s.client_id === targetPeer);
         }
 
-        if (query) {
-          const q = query.toLowerCase();
-          liveShares = liveShares.filter(s => (s.title || '').toLowerCase().includes(q));
+        if (resolvedQuery) {
+          const q = resolvedQuery.toLowerCase();
+          liveShares = liveShares.filter(s => (s.title || '').toLowerCase().includes(q) || (s.owner_name || '').toLowerCase().includes(q));
         }
 
         videos = [...liveShares, ...videos];
@@ -918,8 +936,8 @@ async function fetchSettings() {
                 localStorage.removeItem('media_admin_token');
                 alert('Incorrect admin password. Please try again.');
               } else {
-                fetchSongs(searchInput?.value?.trim() || '', sortSelect?.value || 'title');
-                fetchVideos(searchInput?.value?.trim() || '');
+                fetchSongs(getActiveSongsQuery(), sortSelect?.value || 'title');
+                fetchVideos(getActiveVideosQuery());
                 fetchFavorites();
               }
               await fetchSettings();
@@ -1174,12 +1192,11 @@ function cleanupDeletedMediaFromPlayers(deletedIds) {
 
 async function refreshLibraryAfterDelete() {
   if (typeof modalAllSongsCache !== 'undefined') modalAllSongsCache = [];
-  const q = searchInput ? searchInput.value.trim() : '';
   const sortBy = sortSelect ? sortSelect.value : 'title';
   await Promise.allSettled([
     fetchMyMedia(),
-    fetchSongs(q, sortBy),
-    fetchVideos(q),
+    fetchSongs(getActiveSongsQuery(), sortBy),
+    fetchVideos(getActiveVideosQuery()),
     fetchFavorites(),
     fetchStatus()
   ]);
@@ -3673,8 +3690,21 @@ function switchView(viewName) {
   if (activeViewEl) activeViewEl.classList.add('active');
 
   if (viewName === 'my-device') fetchMyMedia();
-  if (viewName === 'songs') { fetchSongs(); populateMusicFilterDropdowns(); }
-  if (viewName === 'videos') fetchVideos();
+  if (viewName === 'songs') {
+    if (searchInput) {
+      searchInput.value = getActiveSongsQuery();
+      if (clearSearchBtn) clearSearchBtn.classList.toggle('hidden', searchInput.value.length === 0);
+    }
+    fetchSongs(getActiveSongsQuery(), sortSelect ? sortSelect.value : 'title');
+    populateMusicFilterDropdowns();
+  }
+  if (viewName === 'videos') {
+    if (searchInput) {
+      searchInput.value = getActiveVideosQuery();
+      if (clearSearchBtn) clearSearchBtn.classList.toggle('hidden', searchInput.value.length === 0);
+    }
+    fetchVideos(getActiveVideosQuery());
+  }
   if (viewName === 'photos') fetchPhotos();
   if (viewName === 'favorites') fetchFavorites();
   if (viewName === 'downloader') { pollDownloads(); populateDownloaderPlaylists(); }
@@ -4390,12 +4420,76 @@ clearQueueBtn.addEventListener('click', () => {
   renderQueue();
 });
 
-// Search
+// Search (Global top bar + dedicated Audio & Video section search bars)
 let searchTimeout;
+let songsSearchTimeout;
+let videosSearchTimeout;
+
+function syncTopSearchBar(value) {
+  if (!searchInput) return;
+  searchInput.value = value;
+  if (clearSearchBtn) clearSearchBtn.classList.toggle('hidden', value.length === 0);
+}
+
+if (songsSearchInput) {
+  songsSearchInput.addEventListener('input', (e) => {
+    clearTimeout(songsSearchTimeout);
+    const q = e.target.value.trim();
+    state.songsSearchQuery = q;
+    if (songsClearSearchBtn) songsClearSearchBtn.classList.toggle('hidden', q.length === 0);
+    if (state.currentView === 'songs') syncTopSearchBar(q);
+    songsSearchTimeout = setTimeout(() => {
+      fetchSongs(q, sortSelect ? sortSelect.value : 'title');
+    }, 200);
+  });
+}
+
+if (songsClearSearchBtn) {
+  songsClearSearchBtn.addEventListener('click', () => {
+    if (songsSearchInput) songsSearchInput.value = '';
+    state.songsSearchQuery = '';
+    songsClearSearchBtn.classList.add('hidden');
+    if (state.currentView === 'songs') syncTopSearchBar('');
+    fetchSongs('', sortSelect ? sortSelect.value : 'title');
+  });
+}
+
+if (videosSearchInput) {
+  videosSearchInput.addEventListener('input', (e) => {
+    clearTimeout(videosSearchTimeout);
+    const q = e.target.value.trim();
+    state.videosSearchQuery = q;
+    if (videosClearSearchBtn) videosClearSearchBtn.classList.toggle('hidden', q.length === 0);
+    if (state.currentView === 'videos') syncTopSearchBar(q);
+    videosSearchTimeout = setTimeout(() => {
+      fetchVideos(q);
+    }, 200);
+  });
+}
+
+if (videosClearSearchBtn) {
+  videosClearSearchBtn.addEventListener('click', () => {
+    if (videosSearchInput) videosSearchInput.value = '';
+    state.videosSearchQuery = '';
+    videosClearSearchBtn.classList.add('hidden');
+    if (state.currentView === 'videos') syncTopSearchBar('');
+    fetchVideos('');
+  });
+}
+
 searchInput.addEventListener('input', (e) => {
   clearTimeout(searchTimeout);
   const q = e.target.value.trim();
   clearSearchBtn.classList.toggle('hidden', q.length === 0);
+  if (state.currentView === 'videos') {
+    state.videosSearchQuery = q;
+    if (videosSearchInput) videosSearchInput.value = q;
+    if (videosClearSearchBtn) videosClearSearchBtn.classList.toggle('hidden', q.length === 0);
+  } else if (state.currentView === 'songs') {
+    state.songsSearchQuery = q;
+    if (songsSearchInput) songsSearchInput.value = q;
+    if (songsClearSearchBtn) songsClearSearchBtn.classList.toggle('hidden', q.length === 0);
+  }
   searchTimeout = setTimeout(() => {
     if (state.currentView === 'videos') fetchVideos(q);
     else if (state.currentView === 'photos') fetchPhotos(photosAlbumFilter ? photosAlbumFilter.value : '', state.mediaScope);
@@ -4407,13 +4501,23 @@ searchInput.addEventListener('input', (e) => {
 clearSearchBtn.addEventListener('click', () => {
   searchInput.value = '';
   clearSearchBtn.classList.add('hidden');
-  if (state.currentView === 'videos') fetchVideos('');
-  else if (state.currentView === 'favorites') fetchFavorites();
-  else fetchSongs('', sortSelect.value);
+  if (state.currentView === 'videos') {
+    state.videosSearchQuery = '';
+    if (videosSearchInput) videosSearchInput.value = '';
+    if (videosClearSearchBtn) videosClearSearchBtn.classList.add('hidden');
+    fetchVideos('');
+  } else if (state.currentView === 'favorites') {
+    fetchFavorites();
+  } else {
+    state.songsSearchQuery = '';
+    if (songsSearchInput) songsSearchInput.value = '';
+    if (songsClearSearchBtn) songsClearSearchBtn.classList.add('hidden');
+    fetchSongs('', sortSelect.value);
+  }
 });
 
 sortSelect.addEventListener('change', (e) => {
-  fetchSongs(searchInput.value.trim(), e.target.value);
+  fetchSongs(getActiveSongsQuery(), e.target.value);
 });
 
 document.getElementById('play-all-btn').addEventListener('click', () => {
@@ -5404,19 +5508,19 @@ if (seekSlider && seekHoverTooltip) {
 if (filterGenreSelect) {
   filterGenreSelect.addEventListener('change', () => {
     state.selectedGenre = filterGenreSelect.value;
-    fetchSongs(searchInput.value.trim(), sortSelect.value);
+    fetchSongs(getActiveSongsQuery(), sortSelect.value);
   });
 }
 if (filterLanguageSelect) {
   filterLanguageSelect.addEventListener('change', () => {
     state.selectedLanguage = filterLanguageSelect.value;
-    fetchSongs(searchInput.value.trim(), sortSelect.value);
+    fetchSongs(getActiveSongsQuery(), sortSelect.value);
   });
 }
 if (filterYearSelect) {
   filterYearSelect.addEventListener('change', () => {
     state.selectedYear = filterYearSelect.value;
-    fetchSongs(searchInput.value.trim(), sortSelect.value);
+    fetchSongs(getActiveSongsQuery(), sortSelect.value);
   });
 }
 if (clearMusicFiltersBtn) {
@@ -5434,7 +5538,7 @@ if (clearMusicFiltersBtn) {
       c.classList.toggle('active', c.dataset.ribbon === 'all');
     });
     document.querySelectorAll('.sub-ribbon').forEach(sr => sr.classList.add('hidden'));
-    fetchSongs(searchInput.value.trim(), sortSelect.value);
+    fetchSongs(getActiveSongsQuery(), sortSelect.value);
   });
 }
 
@@ -5458,7 +5562,7 @@ function initQuickCategoryRibbon() {
         if (filterLanguageSelect) filterLanguageSelect.value = '';
         if (filterYearSelect) filterYearSelect.value = '';
         document.querySelectorAll('.sub-ribbon').forEach(sr => sr.classList.add('hidden'));
-        fetchSongs(searchInput ? searchInput.value.trim() : '', sortSelect ? sortSelect.value : 'title');
+        fetchSongs(getActiveSongsQuery(), sortSelect ? sortSelect.value : 'title');
       } else if (type === 'albums') {
         switchView('albums');
       } else if (type === 'artists') {
@@ -5469,7 +5573,7 @@ function initQuickCategoryRibbon() {
         state.selectedGenre = 'Devotional';
         if (filterGenreSelect) filterGenreSelect.value = 'Devotional';
         document.querySelectorAll('.sub-ribbon').forEach(sr => sr.classList.add('hidden'));
-        fetchSongs(searchInput ? searchInput.value.trim() : '', sortSelect ? sortSelect.value : 'title');
+        fetchSongs(getActiveSongsQuery(), sortSelect ? sortSelect.value : 'title');
       } else if (type === 'languages-menu') {
         const isCurrentlyHidden = subRibbonLanguages?.classList.contains('hidden');
         document.querySelectorAll('.sub-ribbon').forEach(sr => sr.classList.add('hidden'));
@@ -5542,7 +5646,7 @@ function populateLanguagesSubRibbon() {
         btn.classList.add('active');
         if (filterLanguageSelect) filterLanguageSelect.value = l.language;
       }
-      fetchSongs(searchInput ? searchInput.value.trim() : '', sortSelect ? sortSelect.value : 'title');
+      fetchSongs(getActiveSongsQuery(), sortSelect ? sortSelect.value : 'title');
     };
     subRibbonLanguages.appendChild(btn);
   });
@@ -5572,7 +5676,7 @@ function populateErasSubRibbon() {
         subRibbonEras.querySelectorAll('.sub-chip').forEach(c => c.classList.remove('active'));
         btn.classList.add('active');
       }
-      fetchSongs(searchInput ? searchInput.value.trim() : '', sortSelect ? sortSelect.value : 'title');
+      fetchSongs(getActiveSongsQuery(), sortSelect ? sortSelect.value : 'title');
     };
     subRibbonEras.appendChild(btn);
   });
@@ -5691,7 +5795,7 @@ function updateSmartComboBanner() {
         c.classList.toggle('active', c.dataset.ribbon === 'all');
       });
       document.querySelectorAll('.sub-ribbon').forEach(sr => sr.classList.add('hidden'));
-      fetchSongs(searchInput ? searchInput.value.trim() : '', sortSelect ? sortSelect.value : 'title');
+      fetchSongs(getActiveSongsQuery(), sortSelect ? sortSelect.value : 'title');
     };
   }
 
@@ -5783,9 +5887,9 @@ async function saveMetadataEdits() {
     }
     editMetadataModal.classList.add('hidden');
     if (state.currentView === 'videos') {
-      fetchVideos(searchInput.value.trim());
+      fetchVideos(getActiveVideosQuery());
     } else {
-      fetchSongs(searchInput.value.trim(), sortSelect.value);
+      fetchSongs(getActiveSongsQuery(), sortSelect.value);
     }
     fetchMyMedia();
   } catch (err) {
@@ -5801,7 +5905,7 @@ videoCatPills.forEach(pill => {
     videoCatPills.forEach(p => p.classList.remove('active'));
     pill.classList.add('active');
     state.videoCategory = pill.dataset.cat || 'all';
-    fetchVideos(searchInput.value.trim());
+    fetchVideos(getActiveVideosQuery());
   });
 });
 
@@ -5809,7 +5913,7 @@ const videoDecadeFilter = document.getElementById('video-decade-filter');
 if (videoDecadeFilter) {
   videoDecadeFilter.addEventListener('change', (e) => {
     state.videoDecade = e.target.value;
-    fetchVideos(searchInput.value.trim());
+    fetchVideos(getActiveVideosQuery());
   });
 }
 
@@ -5817,7 +5921,7 @@ const videoResFilter = document.getElementById('video-res-filter');
 if (videoResFilter) {
   videoResFilter.addEventListener('change', (e) => {
     state.videoResolution = e.target.value;
-    fetchVideos(searchInput.value.trim());
+    fetchVideos(getActiveVideosQuery());
   });
 }
 
@@ -5825,7 +5929,7 @@ const videoSortSelect = document.getElementById('video-sort-select');
 if (videoSortSelect) {
   videoSortSelect.addEventListener('change', (e) => {
     state.videoSort = e.target.value;
-    fetchVideos(searchInput.value.trim());
+    fetchVideos(getActiveVideosQuery());
   });
 }
 
@@ -6328,9 +6432,9 @@ document.querySelectorAll('.scope-tab').forEach(tab => {
     state.mediaScope = tab.dataset.scope;
     const target = bar ? bar.dataset.target : 'songs';
     if (target === 'songs') {
-      fetchSongs(searchInput.value.trim(), sortSelect.value, state.mediaScope);
+      fetchSongs(getActiveSongsQuery(), sortSelect.value, state.mediaScope);
     } else if (target === 'videos') {
-      fetchVideos(searchInput.value.trim(), state.mediaScope);
+      fetchVideos(getActiveVideosQuery(), state.mediaScope);
     } else if (target === 'photos') {
       fetchPhotos(photosAlbumFilter ? photosAlbumFilter.value : '', state.mediaScope);
     }
@@ -6360,9 +6464,9 @@ document.querySelectorAll('.peer-scope-dropdown').forEach(select => {
     }
 
     if (target === 'songs') {
-      fetchSongs(searchInput.value.trim(), sortSelect.value, state.mediaScope);
+      fetchSongs(getActiveSongsQuery(), sortSelect.value, state.mediaScope);
     } else if (target === 'videos') {
-      fetchVideos(searchInput.value.trim(), state.mediaScope);
+      fetchVideos(getActiveVideosQuery(), state.mediaScope);
     } else if (target === 'photos') {
       fetchPhotos(photosAlbumFilter ? photosAlbumFilter.value : '', state.mediaScope);
     }

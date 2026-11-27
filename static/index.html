@@ -11,7 +11,7 @@
   <link rel="manifest" href="/manifest.json">
   <link rel="icon" type="image/svg+xml" href="/icon.svg">
   <link rel="apple-touch-icon" href="/icon.svg">
-  <link rel="stylesheet" href="/style.css?v=2.4">
+  <link rel="stylesheet" href="/style.css?v=2.5">
 </head>
 <body>
   <div class="app-layout">
@@ -439,6 +439,23 @@
             </div>
           </div>
 
+          <!-- Audio Search Bar -->
+          <div class="section-search-bar">
+            <div class="search-box section-search-box">
+              <svg viewBox="0 0 24 24" width="17" height="17" stroke="currentColor" stroke-width="2" fill="none">
+                <circle cx="11" cy="11" r="8"></circle>
+                <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+              </svg>
+              <input type="text" id="songs-search-input" placeholder="Search available audio by title, artist, or album..." autocomplete="off">
+              <button id="songs-clear-search" class="icon-btn hidden" type="button" title="Clear audio search">
+                <svg viewBox="0 0 24 24" width="15" height="15" stroke="currentColor" stroke-width="2" fill="none">
+                  <line x1="18" y1="6" x2="6" y2="18"></line>
+                  <line x1="6" y1="6" x2="18" y2="18"></line>
+                </svg>
+              </button>
+            </div>
+          </div>
+
           <!-- Quick Category Ribbon -->
           <div class="song-quick-ribbon-container">
             <div class="song-quick-ribbon" id="song-quick-ribbon">
@@ -507,6 +524,24 @@
               </button>
             </div>
           </div>
+
+          <!-- Video Search Bar -->
+          <div class="section-search-bar">
+            <div class="search-box section-search-box">
+              <svg viewBox="0 0 24 24" width="17" height="17" stroke="currentColor" stroke-width="2" fill="none">
+                <circle cx="11" cy="11" r="8"></circle>
+                <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+              </svg>
+              <input type="text" id="videos-search-input" placeholder="Search available videos & movies..." autocomplete="off">
+              <button id="videos-clear-search" class="icon-btn hidden" type="button" title="Clear video search">
+                <svg viewBox="0 0 24 24" width="15" height="15" stroke="currentColor" stroke-width="2" fill="none">
+                  <line x1="18" y1="6" x2="6" y2="18"></line>
+                  <line x1="6" y1="6" x2="18" y2="18"></line>
+                </svg>
+              </button>
+            </div>
+          </div>
+
           <div class="video-grid" id="video-grid"></div>
         </div>
 
@@ -2052,6 +2087,6 @@
   <input type="file" id="local-playback-input" multiple accept="audio/*,video/*,.mp3,.flac,.m4a,.wav,.mp4,.mkv,.webm,.mov" style="display: none;">
   <input type="file" id="photo-upload-input" multiple accept="image/*,.jpg,.jpeg,.png,.webp,.heic,.gif,.bmp" style="display: none;">
 
-  <script src="/app.js?v=2.4"></script>
+  <script src="/app.js?v=2.5"></script>
 </body>
 </html>
