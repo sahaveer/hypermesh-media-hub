@@ -69,21 +69,6 @@ async def lifespan(app: FastAPI):
     if settings.is_global_access_enabled():
         token = settings.load_settings().get("global_tunnel_token")
         threading.Thread(target=tunnel.start_tunnel, args=(config.PORT, token), daemon=True).start()
-    # Auto-pull APK from private GitHub release on startup if missing and token is configured
-    if _find_apk_file() is None:
-        cur_settings = settings.load_settings()
-        has_gh_token = bool(
-            cur_settings.get("apk_github_token", "").strip()
-            or os.environ.get("APK_GITHUB_TOKEN", "").strip()
-            or os.environ.get("GITHUB_TOKEN", "").strip()
-        )
-        if has_gh_token:
-            def _startup_apk_sync():
-                try:
-                    sync_apk_from_github()
-                except Exception:
-                    pass
-            threading.Thread(target=_startup_apk_sync, daemon=True).start()
     yield
     mesh.stop_mesh_service()
     tunnel.stop_tunnel()
@@ -149,13 +134,6 @@ class UpdateSettingsRequest(BaseModel):
     download_browser_cookies: Optional[str] = None
     max_concurrent_downloads: Optional[int] = None
     download_rate_limit_kbps: Optional[int] = None
-    apk_github_repo: Optional[str] = None
-    apk_github_token: Optional[str] = None
-
-class SyncApkRequest(BaseModel):
-    repo: Optional[str] = None
-    token: Optional[str] = None
-    tag: Optional[str] = None
 
 class AddFolderRequest(BaseModel):
     path: str
@@ -399,191 +377,10 @@ def generate_qr_code(url: Optional[str] = None):
 def get_all_settings():
     return public_settings(settings.load_settings())
 
-# --- APP UPDATE ENDPOINTS (OPTION B - LINUX SERVER OTA) ---
-APK_DIR = config.DATA_DIR / "apk"
-APK_DIR.mkdir(parents=True, exist_ok=True)
-APK_INFO_FILE = APK_DIR / "version.json"
-
-def _find_apk_file() -> Optional[pathlib.Path]:
-    candidates = [
-        APK_DIR / "hypermeshmediaplayer.apk",
-        APK_DIR / "latest.apk",
-        config.BASE_DIR / "static" / "hypermeshmediaplayer.apk",
-        config.BASE_DIR / "static" / "latest.apk",
-        config.APP_DIR / "hypermeshmediaplayer.apk",
-        config.APP_DIR / "latest.apk",
-    ]
-    for p in candidates:
-        if p.is_file():
-            return p
-    return None
-
-def _parse_release_version(tag_name: str) -> tuple[str, int]:
-    clean = (tag_name or "").strip().lstrip("vV")
-    match = re.match(r"^([0-9]+(?:\.[0-9]+)*)(?:\+([0-9]+))?", clean)
-    if match:
-        version = match.group(1)
-        build_number = int(match.group(2)) if match.group(2) else 1
-        return version, build_number
-    return "1.0.0", 1
-
-def sync_apk_from_github(
-    repo: Optional[str] = None,
-    token: Optional[str] = None,
-    tag: Optional[str] = None,
-) -> Dict[str, Any]:
-    current = settings.load_settings()
-    target_repo = (repo or current.get("apk_github_repo") or "sahaveer/hypermesh-mobile-app").strip()
-    if not re.match(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$", target_repo):
-        raise HTTPException(status_code=400, detail="Invalid GitHub repository format. Use owner/repo.")
-
-    auth_token = (
-        token
-        or current.get("apk_github_token")
-        or os.environ.get("APK_GITHUB_TOKEN")
-        or os.environ.get("GITHUB_TOKEN")
-        or ""
-    ).strip()
-
-    api_url = (
-        f"https://api.github.com/repos/{target_repo}/releases/tags/{urllib.parse.quote(tag.strip())}"
-        if tag and tag.strip()
-        else f"https://api.github.com/repos/{target_repo}/releases/latest"
-    )
-    headers = {
-        "Accept": "application/vnd.github+json",
-        "User-Agent": "Hypermesh-MediaPlayer",
-        "X-GitHub-Api-Version": "2022-11-28",
-    }
-    if auth_token:
-        headers["Authorization"] = f"Bearer {auth_token}"
-
-    try:
-        req = urllib.request.Request(api_url, headers=headers)
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            release = json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as err:
-        detail = f"GitHub API returned HTTP {err.code} for {target_repo}."
-        if err.code in (401, 403, 404) and not auth_token:
-            detail += " Set apk_github_token (or APK_GITHUB_TOKEN env var) for private repo access."
-        raise HTTPException(status_code=502, detail=detail)
-    except Exception as err:
-        raise HTTPException(status_code=502, detail=f"Failed to query GitHub release: {err}")
-
-    assets = release.get("assets") or []
-    apk_asset = next(
-        (a for a in assets if str(a.get("name", "")).lower() == "hypermeshmediaplayer.apk"),
-        None,
-    ) or next(
-        (a for a in assets if str(a.get("name", "")).lower().endswith(".apk")),
-        None,
-    )
-    if not apk_asset or not apk_asset.get("url"):
-        raise HTTPException(status_code=404, detail="No .apk asset found in the GitHub release.")
-
-    dl_headers = {
-        "Accept": "application/octet-stream",
-        "User-Agent": "Hypermesh-MediaPlayer",
-    }
-    if auth_token:
-        dl_headers["Authorization"] = f"Bearer {auth_token}"
-
-    APK_DIR.mkdir(parents=True, exist_ok=True)
-    tmp_path = APK_DIR / "hypermeshmediaplayer.apk.tmp"
-    final_path = APK_DIR / "hypermeshmediaplayer.apk"
-    try:
-        dl_req = urllib.request.Request(apk_asset["url"], headers=dl_headers)
-        with urllib.request.urlopen(dl_req, timeout=180) as resp, open(tmp_path, "wb") as out:
-            shutil.copyfileobj(resp, out)
-        with open(tmp_path, "rb") as check_f:
-            magic = check_f.read(2)
-        if magic != b"PK":
-            raise ValueError("Downloaded asset is not a valid APK archive.")
-        tmp_path.replace(final_path)
-    except HTTPException:
-        raise
-    except Exception as err:
-        if tmp_path.exists():
-            try:
-                tmp_path.unlink()
-            except Exception:
-                pass
-        raise HTTPException(status_code=502, detail=f"Failed to download APK asset from GitHub: {err}")
-
-    version, build_number = _parse_release_version(str(release.get("tag_name") or ""))
-    info_payload = {
-        "version": version,
-        "build_number": build_number,
-        "apk_url": "/hypermeshmediaplayer.apk",
-        "release_notes": str(release.get("body") or release.get("name") or "Official release of Hypermesh Media Player."),
-        "github_repo": target_repo,
-        "tag_name": release.get("tag_name") or "",
-        "asset_name": apk_asset.get("name") or "hypermeshmediaplayer.apk",
-        "synced_at": int(time.time()),
-    }
-    with open(APK_INFO_FILE, "w", encoding="utf-8") as f:
-        json.dump(info_payload, f, indent=2)
-
-    return {
-        "status": "synced",
-        "size": final_path.stat().st_size,
-        **info_payload,
-    }
-
-@app.get("/api/app/version")
-def get_app_version():
-    current = settings.load_settings()
-    apk_available = _find_apk_file() is not None
-    if APK_INFO_FILE.exists():
-        try:
-            with open(APK_INFO_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                data.setdefault("apk_url", "/hypermeshmediaplayer.apk")
-                data["apk_available"] = apk_available
-                data["github_repo"] = current.get("apk_github_repo", "sahaveer/hypermesh-mobile-app")
-                return data
-        except Exception:
-            pass
-    return {
-        "version": "1.0.0",
-        "build_number": 1,
-        "apk_url": "/hypermeshmediaplayer.apk",
-        "apk_available": apk_available,
-        "github_repo": current.get("apk_github_repo", "sahaveer/hypermesh-mobile-app"),
-        "release_notes": "Official release of Hypermesh Media Player."
-    }
-
-@app.post("/api/app/sync-github")
-def sync_app_apk_from_github(request: Request, body: Optional[SyncApkRequest] = None):
-    if not is_host_admin(request):
-        raise HTTPException(
-            status_code=403,
-            detail="Permission denied. Only the host server administrator can sync the APK from GitHub."
-        )
-    req_body = body or SyncApkRequest()
-    return sync_apk_from_github(repo=req_body.repo, token=req_body.token, tag=req_body.tag)
-
-@app.get("/hypermeshmediaplayer.apk")
-@app.get("/api/app/latest.apk")
-def download_latest_apk():
-    apk_path = _find_apk_file()
-    if apk_path:
-        return FileResponse(
-            str(apk_path),
-            media_type="application/vnd.android.package-archive",
-            filename="hypermeshmediaplayer.apk"
-        )
-    raise HTTPException(status_code=404, detail="No update APK uploaded to this server yet")
-
-
 def public_settings(current):
     result = dict(current)
     result["admin_password_set"] = bool(result.pop("admin_token", "").strip())
-    result["apk_github_token_set"] = bool(
-        result.pop("apk_github_token", "").strip()
-        or os.environ.get("APK_GITHUB_TOKEN", "").strip()
-        or os.environ.get("GITHUB_TOKEN", "").strip()
-    )
+    result.pop("apk_github_token", None)
     result.pop("global_tunnel_token", None)
     return result
 
@@ -622,10 +419,6 @@ def update_settings(body: UpdateSettingsRequest, request: Request):
         current["max_concurrent_downloads"] = max(1, min(10, int(body.max_concurrent_downloads)))
     if body.download_rate_limit_kbps is not None:
         current["download_rate_limit_kbps"] = max(0, int(body.download_rate_limit_kbps))
-    if body.apk_github_repo is not None:
-        current["apk_github_repo"] = body.apk_github_repo.strip()
-    if body.apk_github_token is not None:
-        current["apk_github_token"] = body.apk_github_token.strip()
 
     settings.save_settings(current)
     # Trigger rescan to apply privacy mode

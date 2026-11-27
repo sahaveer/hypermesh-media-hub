@@ -53,8 +53,6 @@ def get_default_settings() -> Dict[str, Any]:
         "download_browser_cookies": "",  # Optional default browser session cookies ("chrome", "edge", "firefox", or "")
         "max_concurrent_downloads": 2,
         "download_rate_limit_kbps": 0,  # 0 = unlimited
-        "apk_github_repo": "sahaveer/hypermesh-mobile-app",
-        "apk_github_token": "",
         "shared_folders": shared_folders
     }
 
@@ -95,10 +93,6 @@ def load_settings() -> Dict[str, Any]:
                 data["max_concurrent_downloads"] = 2
             if "download_rate_limit_kbps" not in data:
                 data["download_rate_limit_kbps"] = 0
-            if "apk_github_repo" not in data:
-                data["apk_github_repo"] = "sahaveer/hypermesh-mobile-app"
-            if "apk_github_token" not in data:
-                data["apk_github_token"] = ""
             # Repair the bundled Windows example only on a Linux host where
             # the confirmed CasaOS video library actually exists.
             if os.name != "nt" and pathlib.Path("/DATA/Media/Videos").is_dir():

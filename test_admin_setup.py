@@ -1,3 +1,4 @@
+import os
 import unittest
 import pathlib
 import tempfile
@@ -63,6 +64,17 @@ class AdminSetupTests(unittest.TestCase):
             with self.assertRaises(HTTPException) as error:
                 main.browse_server_folders(self.request(), str(root / 'Missing'))
             self.assertEqual(error.exception.status_code, 404)
+
+    def test_load_dotenv_file_sets_missing_env_vars(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = pathlib.Path(tmp) / ".env"
+            env_file.write_text('# comment\nTEST_DOTENV_TOKEN="test_token_from_dotenv"\nexport TEST_FLAG=yes\n', encoding="utf-8")
+            with patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("TEST_DOTENV_TOKEN", None)
+                os.environ.pop("TEST_FLAG", None)
+                main.config._load_dotenv_file(env_file)
+                self.assertEqual(os.environ.get("TEST_DOTENV_TOKEN"), "test_token_from_dotenv")
+                self.assertEqual(os.environ.get("TEST_FLAG"), "yes")
 
 if __name__ == '__main__':
     unittest.main()
