@@ -1,6 +1,6 @@
 # Hypermesh Media Hub (Open-Source Personal Media Server, Mesh Hub & `yt-dlp` Downloader)
 
-[![Download Android App APK](https://img.shields.io/badge/Android_App_APK-v1.0.0%2B1-00E5FF?style=for-the-badge&logo=android&logoColor=black)](https://github.com/sahaveer/hypermesh-mobile-app/releases/latest/download/hypermeshmediaplayer.apk)
+[![Download Android App APK](https://img.shields.io/badge/Android_App_APK-Latest-00E5FF?style=for-the-badge&logo=android&logoColor=black)](https://github.com/sahaveer/hypermesh-mobile-app/releases/latest/download/hypermeshmediaplayer.apk)
 
 An open-source, self-hosted **Peer-to-Peer Mesh Media Server & Universal Downloader** built with **FastAPI**, **yt-dlp**, **FFmpeg**, and a built-in **Progressive Web App (PWA)** player.
 
@@ -14,7 +14,7 @@ An open-source, self-hosted **Peer-to-Peer Mesh Media Server & Universal Downloa
 Don't want to compile the mobile app yourself? Download and install it directly on any Android phone:
 
 - **Direct APK Download:** [`hypermeshmediaplayer.apk` (Latest Release)](https://github.com/sahaveer/hypermesh-mobile-app/releases/latest/download/hypermeshmediaplayer.apk)
-- **GitHub Release Page:** https://github.com/sahaveer/hypermesh-mobile-app/releases/tag/v1.0.0%2B1
+- **GitHub Release Page:** https://github.com/sahaveer/hypermesh-mobile-app/releases/latest
 - **Mobile App Source Repo:** https://github.com/sahaveer/hypermesh-mobile-app
 
 > Even without a PC server, phones running the Android app on the same Wi-Fi/hotspot can share audio and video with each other over the local mesh. Adding **this server repo** on a PC/laptop/Raspberry Pi unlocks always-on offline libraries and server-side **`yt-dlp` YouTube downloading**.
