@@ -179,13 +179,19 @@ def _do_init_db():
                 camera_model TEXT,
                 mime_type TEXT,
                 owner_id TEXT DEFAULT 'host',
-                owner_name TEXT DEFAULT 'Host'
+                owner_name TEXT DEFAULT 'Host',
+                content_hash TEXT
             )
         """)
+        cursor.execute("PRAGMA table_info(photos)")
+        photo_cols = {col["name"] for col in cursor.fetchall()}
+        if "content_hash" not in photo_cols:
+            cursor.execute("ALTER TABLE photos ADD COLUMN content_hash TEXT")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_photos_date ON photos(date_taken)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_photos_year_month ON photos(year, month)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_photos_owner ON photos(owner_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_photos_album ON photos(album)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_photos_content_hash ON photos(content_hash)")
 
         # Pending Uploads (Approval Queue) Table
         cursor.execute("""
@@ -198,11 +204,41 @@ def _do_init_db():
                 owner_id TEXT DEFAULT 'host',
                 owner_name TEXT DEFAULT 'Host',
                 target_folder TEXT,
+                content_hash TEXT,
                 status TEXT DEFAULT 'pending',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        cursor.execute("PRAGMA table_info(pending_uploads)")
+        pending_cols = {col["name"] for col in cursor.fetchall()}
+        if "content_hash" not in pending_cols:
+            cursor.execute("ALTER TABLE pending_uploads ADD COLUMN content_hash TEXT")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_pending_status ON pending_uploads(status)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_pending_content_hash ON pending_uploads(content_hash)")
+
+        # Chunked / Resumable Upload Sessions Table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS upload_sessions (
+                id TEXT PRIMARY KEY,
+                filename TEXT NOT NULL,
+                media_type TEXT NOT NULL,
+                total_size INTEGER NOT NULL,
+                chunk_size INTEGER NOT NULL,
+                received_bytes INTEGER DEFAULT 0,
+                content_hash TEXT,
+                owner_id TEXT DEFAULT 'host',
+                owner_name TEXT DEFAULT 'Host',
+                playlist_id TEXT,
+                staging_path TEXT NOT NULL,
+                status TEXT DEFAULT 'uploading',
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            )
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_upload_sessions_lookup
+            ON upload_sessions(owner_id, content_hash, filename, total_size, status)
+        """)
 
         # 24-Hour Ephemeral Statuses (Stories / Worker Updates)
         cursor.execute("""
@@ -1219,8 +1255,8 @@ def upsert_photo(photo_data: Dict[str, Any]):
             INSERT INTO photos (
                 id, path, title, album, date_taken, year, month,
                 width, height, filesize, mtime, thumb_hash,
-                camera_make, camera_model, mime_type, owner_id, owner_name
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                camera_make, camera_model, mime_type, owner_id, owner_name, content_hash
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(path) DO UPDATE SET
                 title=excluded.title,
                 album=excluded.album,
@@ -1236,7 +1272,8 @@ def upsert_photo(photo_data: Dict[str, Any]):
                 camera_model=excluded.camera_model,
                 mime_type=excluded.mime_type,
                 owner_id=excluded.owner_id,
-                owner_name=excluded.owner_name
+                owner_name=excluded.owner_name,
+                content_hash=COALESCE(excluded.content_hash, photos.content_hash)
         """, (
             photo_data["id"],
             photo_data["path"],
@@ -1254,9 +1291,46 @@ def upsert_photo(photo_data: Dict[str, Any]):
             photo_data.get("camera_model"),
             photo_data.get("mime_type", "image/jpeg"),
             photo_data.get("owner_id", "host"),
-            photo_data.get("owner_name", "Host")
+            photo_data.get("owner_name", "Host"),
+            photo_data.get("content_hash")
         ))
         conn.commit()
+
+def get_photo_by_hash(content_hash: str) -> Optional[Dict[str, Any]]:
+    if not content_hash:
+        return None
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM photos WHERE content_hash = ? LIMIT 1", (content_hash,))
+        row = cursor.fetchone()
+        return dict(row) if row else None
+
+def get_existing_photo_hashes(hashes: List[str]) -> Dict[str, str]:
+    clean = [h.strip().lower() for h in hashes if h and h.strip()]
+    if not clean:
+        return {}
+    found: Dict[str, str] = {}
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        # Query in chunks to stay well under SQLite's parameter limit
+        for i in range(0, len(clean), 400):
+            batch = clean[i:i + 400]
+            placeholders = ",".join("?" for _ in batch)
+            cursor.execute(
+                f"SELECT content_hash, id FROM photos WHERE content_hash IN ({placeholders})",
+                batch,
+            )
+            for row in cursor.fetchall():
+                if row["content_hash"]:
+                    found[row["content_hash"]] = row["id"]
+            cursor.execute(
+                f"SELECT content_hash, id FROM pending_uploads WHERE status = 'pending' AND content_hash IN ({placeholders})",
+                batch,
+            )
+            for row in cursor.fetchall():
+                if row["content_hash"] and row["content_hash"] not in found:
+                    found[row["content_hash"]] = f"pending:{row['id']}"
+    return found
 
 def get_photos(
     query: Optional[str] = None,
@@ -1381,21 +1455,117 @@ def add_pending_upload(
     media_type: str = "audio",
     owner_id: str = "host",
     owner_name: str = "Host",
-    target_folder: Optional[str] = None
+    target_folder: Optional[str] = None,
+    content_hash: Optional[str] = None
 ) -> str:
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("""
             INSERT INTO pending_uploads (
                 id, filename, staging_path, filesize, media_type,
-                owner_id, owner_name, target_folder, status
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending')
+                owner_id, owner_name, target_folder, content_hash, status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
         """, (
             upload_id, filename, staging_path, filesize, media_type,
-            owner_id, owner_name, target_folder
+            owner_id, owner_name, target_folder, content_hash
         ))
         conn.commit()
     return upload_id
+
+def has_pending_upload_hash(content_hash: str) -> Optional[Dict[str, Any]]:
+    if not content_hash:
+        return None
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT * FROM pending_uploads WHERE status = 'pending' AND content_hash = ? LIMIT 1",
+            (content_hash,),
+        )
+        row = cursor.fetchone()
+        return dict(row) if row else None
+
+# --- Chunked / Resumable Upload Sessions ---
+def create_upload_session(
+    upload_id: str,
+    filename: str,
+    media_type: str,
+    total_size: int,
+    chunk_size: int,
+    staging_path: str,
+    content_hash: Optional[str] = None,
+    owner_id: str = "host",
+    owner_name: str = "Host",
+    playlist_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    import time as _time
+    now = _time.time()
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO upload_sessions (
+                id, filename, media_type, total_size, chunk_size,
+                received_bytes, content_hash, owner_id, owner_name,
+                playlist_id, staging_path, status, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, 'uploading', ?, ?)
+        """, (
+            upload_id, filename, media_type, total_size, chunk_size,
+            content_hash, owner_id, owner_name, playlist_id, staging_path, now, now
+        ))
+        conn.commit()
+    return get_upload_session(upload_id)
+
+def get_upload_session(upload_id: str) -> Optional[Dict[str, Any]]:
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM upload_sessions WHERE id = ?", (upload_id,))
+        row = cursor.fetchone()
+        return dict(row) if row else None
+
+def find_resumable_upload_session(
+    owner_id: str,
+    content_hash: Optional[str],
+    filename: str,
+    total_size: int,
+) -> Optional[Dict[str, Any]]:
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        if content_hash:
+            cursor.execute("""
+                SELECT * FROM upload_sessions
+                WHERE owner_id = ? AND content_hash = ? AND total_size = ? AND status = 'uploading'
+                ORDER BY updated_at DESC LIMIT 1
+            """, (owner_id, content_hash, total_size))
+        else:
+            cursor.execute("""
+                SELECT * FROM upload_sessions
+                WHERE owner_id = ? AND filename = ? AND total_size = ? AND status = 'uploading'
+                ORDER BY updated_at DESC LIMIT 1
+            """, (owner_id, filename, total_size))
+        row = cursor.fetchone()
+        return dict(row) if row else None
+
+def update_upload_session_progress(upload_id: str, received_bytes: int, status: Optional[str] = None) -> None:
+    import time as _time
+    now = _time.time()
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        if status:
+            cursor.execute(
+                "UPDATE upload_sessions SET received_bytes = ?, status = ?, updated_at = ? WHERE id = ?",
+                (received_bytes, status, now, upload_id),
+            )
+        else:
+            cursor.execute(
+                "UPDATE upload_sessions SET received_bytes = ?, updated_at = ? WHERE id = ?",
+                (received_bytes, now, upload_id),
+            )
+        conn.commit()
+
+def delete_upload_session(upload_id: str) -> None:
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM upload_sessions WHERE id = ?", (upload_id,))
+        conn.commit()
 
 def get_pending_uploads(status: str = "pending") -> List[Dict[str, Any]]:
     with get_db_connection() as conn:

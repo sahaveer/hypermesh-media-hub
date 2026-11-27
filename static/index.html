@@ -1355,6 +1355,12 @@
       <div class="video-modal-header">
         <h3 id="video-modal-title">Movie Title</h3>
         <div class="video-modal-actions">
+          <select id="video-quality-select" class="secondary-btn" title="Streaming Mode / Quality" style="padding:6px 10px;border-radius:8px;font-size:12px;">
+            <option value="direct">Direct Stream</option>
+            <option value="720p">HLS 720p (Fast Remote)</option>
+            <option value="480p">HLS 480p (Data Saver)</option>
+            <option value="360p">HLS 360p (Low Bandwidth)</option>
+          </select>
           <button id="video-modal-delete-btn" class="video-modal-delete-btn hidden" title="Delete Video from Library">
             <svg viewBox="0 0 24 24" width="16" height="16" stroke="currentColor" stroke-width="2" fill="none">
               <polyline points="3 6 5 6 21 6"></polyline>

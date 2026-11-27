@@ -513,7 +513,15 @@ def parse_media_file(file_path: pathlib.Path, folder_type: str = "both", owner_i
         "owner_name": owner_name
     }
 
-def parse_photo_file(file_path: pathlib.Path, owner_id: str = "host", owner_name: str = "Host") -> Optional[Dict[str, Any]]:
+def compute_file_sha256(file_path: pathlib.Path, chunk_size: int = 1024 * 1024) -> str:
+    """Computes streaming SHA-256 hex digest without loading the whole file in memory."""
+    digest = hashlib.sha256()
+    with open(file_path, "rb") as f:
+        while chunk := f.read(chunk_size):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+def parse_photo_file(file_path: pathlib.Path, owner_id: str = "host", owner_name: str = "Host", content_hash: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """Extracts metadata, dimensions, EXIF tags, and generates cached thumbnail for a photo."""
     try:
         stat = file_path.stat()
@@ -605,6 +613,12 @@ def parse_photo_file(file_path: pathlib.Path, owner_id: str = "host", owner_name
     album = parent_name if parent_name and parent_name not in ("Pictures", "Photos", "Downloads", "Desktop", "") else "Camera / Uploads"
     title = file_path.stem
 
+    if not content_hash:
+        try:
+            content_hash = compute_file_sha256(file_path)
+        except Exception:
+            content_hash = None
+
     return {
         "id": photo_id,
         "path": str_path,
@@ -622,7 +636,8 @@ def parse_photo_file(file_path: pathlib.Path, owner_id: str = "host", owner_name
         "camera_model": str(camera_model).strip() if camera_model else None,
         "mime_type": mime_type,
         "owner_id": owner_id,
-        "owner_name": owner_name
+        "owner_name": owner_name,
+        "content_hash": content_hash,
     }
 
 def scan_library(full_rescan: bool = False) -> Dict[str, Any]:

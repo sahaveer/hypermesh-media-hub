@@ -6574,26 +6574,113 @@ if (uploadPhotosBtn) {
   });
 }
 
+async function computeFileSha256Hex(file) {
+  if (!window.crypto || !window.crypto.subtle) return null;
+  const buf = await file.arrayBuffer();
+  const digest = await window.crypto.subtle.digest('SHA-256', buf);
+  return Array.from(new Uint8Array(digest)).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+async function uploadLargeFileChunked(file, contentHash, mediaType = 'photo') {
+  const chunkSize = 8 * 1024 * 1024;
+  const initRes = await apiFetch('/api/upload/chunked/init', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      filename: file.name,
+      total_size: file.size,
+      chunk_size: chunkSize,
+      content_hash: contentHash,
+      media_type: mediaType,
+      client_id: clientId,
+      device_name: getDeviceType(),
+    }),
+  });
+  const initData = await initRes.json();
+  if (!initRes.ok) throw new Error(initData.detail || 'Could not start chunked upload');
+  if (initData.deduplicated) return { status: 'duplicate' };
+
+  let offset = initData.next_offset || 0;
+  const step = initData.chunk_size || chunkSize;
+  while (offset < file.size) {
+    const end = Math.min(offset + step, file.size);
+    const slice = file.slice(offset, end);
+    const putRes = await apiFetch(`/api/upload/chunked/${encodeURIComponent(initData.upload_id)}?offset=${offset}`, {
+      method: 'PUT',
+      body: slice,
+    });
+    const putData = await putRes.json();
+    if (!putRes.ok) throw new Error(putData.detail || 'Chunk upload failed');
+    offset = putData.next_offset ?? end;
+  }
+  const doneRes = await apiFetch(`/api/upload/chunked/${encodeURIComponent(initData.upload_id)}/complete`, {
+    method: 'POST',
+  });
+  const doneData = await doneRes.json();
+  if (!doneRes.ok) throw new Error(doneData.detail || 'Could not finalize upload');
+  return doneData;
+}
+
 if (photoUploadInput) {
   photoUploadInput.addEventListener('change', async (e) => {
     const files = Array.from(e.target.files || []);
     if (files.length === 0) return;
 
-    serverBadge.textContent = `Uploading ${files.length} photos...`;
+    serverBadge.textContent = `Checking ${files.length} photos...`;
     serverBadge.style.color = '#f59e0b';
 
-    const formData = new FormData();
-    files.forEach(f => formData.append('files', f));
-    formData.append('client_id', clientId);
-    formData.append('device_name', getDeviceType());
-
     try {
-      const res = await apiFetch('/api/upload/photos', {
-        method: 'POST',
-        body: formData
-      });
-      const data = await res.json();
-      alert(data.message || 'Photos uploaded!');
+      const hashed = [];
+      for (const f of files) {
+        const h = f.size <= 64 * 1024 * 1024 ? await computeFileSha256Hex(f) : null;
+        hashed.push({ file: f, hash: h });
+      }
+      const checkHashes = hashed.map(x => x.hash).filter(Boolean);
+      let existingSet = new Set();
+      if (checkHashes.length > 0) {
+        const chk = await apiFetch('/api/upload/photos/check', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ hashes: checkHashes }),
+        });
+        if (chk.ok) {
+          const chkData = await chk.json();
+          existingSet = new Set(chkData.existing || []);
+        }
+      }
+
+      const toUpload = hashed.filter(x => !x.hash || !existingSet.has(x.hash));
+      let skipped = hashed.length - toUpload.length;
+      let added = 0;
+      let pending = 0;
+
+      const smallFiles = [];
+      for (const item of toUpload) {
+        if (item.file.size > 20 * 1024 * 1024) {
+          serverBadge.textContent = `Uploading ${item.file.name} (chunked)...`;
+          const res = await uploadLargeFileChunked(item.file, item.hash, 'photo');
+          if (res.status === 'duplicate') skipped++;
+          else if (res.status === 'pending') pending++;
+          else added++;
+        } else {
+          smallFiles.push(item.file);
+        }
+      }
+
+      if (smallFiles.length > 0) {
+        serverBadge.textContent = `Uploading ${smallFiles.length} photos...`;
+        const formData = new FormData();
+        smallFiles.forEach(f => formData.append('files', f));
+        formData.append('client_id', clientId);
+        formData.append('device_name', getDeviceType());
+        const res = await apiFetch('/api/upload/photos', { method: 'POST', body: formData });
+        const data = await res.json();
+        added += data.saved_count || 0;
+        pending += data.pending_count || 0;
+        skipped += data.skipped_count || 0;
+      }
+
+      alert(`Photos processed: ${added} added, ${skipped} duplicates skipped, ${pending} pending approval.`);
       fetchPhotos();
       fetchStatus();
     } catch (err) {

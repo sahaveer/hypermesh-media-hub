@@ -4,6 +4,7 @@ import io
 import json
 import time
 import uuid
+import hashlib
 import shutil
 import urllib.parse
 import urllib.request
@@ -837,6 +838,152 @@ def copy_live_peer_share_to_server(share_id: str, request: Request):
     }
 
 # --- Downloader & Upload API ---
+class UploadHashCheckRequest(BaseModel):
+    hashes: List[str] = []
+
+
+class ChunkedUploadInitRequest(BaseModel):
+    filename: str
+    total_size: int
+    chunk_size: int = 8 * 1024 * 1024
+    content_hash: Optional[str] = None
+    media_type: Optional[str] = None
+    client_id: Optional[str] = None
+    device_name: Optional[str] = None
+    playlist_id: Optional[str] = None
+
+
+def _sanitize_upload_filename(filename: str) -> str:
+    clean = pathlib.Path(filename or "").name.strip()
+    if not clean or clean in (".", ".."):
+        raise HTTPException(status_code=400, detail="Invalid filename")
+    return clean
+
+
+def _detect_media_type(filename: str, override: Optional[str] = None) -> str:
+    if override in ("photo", "video", "audio"):
+        return override
+    suffix = pathlib.Path(filename).suffix.lower()
+    if suffix in config.PHOTO_EXTENSIONS:
+        return "photo"
+    if suffix in config.VIDEO_EXTENSIONS:
+        return "video"
+    return "audio"
+
+
+def _unique_dest_path(target_dir: pathlib.Path, filename: str) -> pathlib.Path:
+    candidate = target_dir / filename
+    if not candidate.exists():
+        return candidate
+    stem = pathlib.Path(filename).stem
+    suffix = pathlib.Path(filename).suffix
+    return target_dir / f"{stem}_{uuid.uuid4().hex[:6]}{suffix}"
+
+
+def _finalize_uploaded_file(
+    temp_path: pathlib.Path,
+    filename: str,
+    media_type: str,
+    owner_id: str,
+    owner_name: str,
+    approval_required: bool,
+    content_hash: Optional[str] = None,
+    playlist_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    clean_name = _sanitize_upload_filename(filename)
+    is_photo = media_type == "photo"
+    clean_hash = content_hash.strip().lower() if content_hash else None
+
+    if is_photo and clean_hash:
+        existing_photo = database.get_photo_by_hash(clean_hash)
+        if existing_photo:
+            temp_path.unlink(missing_ok=True)
+            return {
+                "status": "duplicate",
+                "deduplicated": True,
+                "photo_id": existing_photo["id"],
+                "filename": clean_name,
+                "message": f"Skipped duplicate '{clean_name}' (already backed up).",
+            }
+        existing_pending = database.has_pending_upload_hash(clean_hash)
+        if existing_pending:
+            temp_path.unlink(missing_ok=True)
+            return {
+                "status": "duplicate",
+                "deduplicated": True,
+                "upload_id": existing_pending["id"],
+                "filename": clean_name,
+                "message": f"Skipped duplicate '{clean_name}' (already pending approval).",
+            }
+
+    filesize = temp_path.stat().st_size if temp_path.exists() else 0
+    if approval_required:
+        upload_id = str(uuid.uuid4())
+        config.STAGING_DIR.mkdir(parents=True, exist_ok=True)
+        staging_path = config.STAGING_DIR / f"{upload_id}_{clean_name}"
+        shutil.move(str(temp_path), str(staging_path))
+        database.add_pending_upload(
+            upload_id=upload_id,
+            filename=clean_name,
+            staging_path=str(staging_path.resolve()),
+            filesize=filesize,
+            media_type=media_type,
+            owner_id=owner_id,
+            owner_name=owner_name,
+            target_folder=str(config.DEFAULT_PHOTO_DIR if is_photo else settings.get_target_upload_folder(media_type)),
+            content_hash=clean_hash,
+        )
+        return {
+            "status": "pending",
+            "deduplicated": False,
+            "upload_id": upload_id,
+            "filename": clean_name,
+            "message": f"'{clean_name}' sent to host approval queue.",
+            "owner_name": owner_name,
+        }
+
+    target_dir = config.DEFAULT_PHOTO_DIR if is_photo else settings.get_target_upload_folder(media_type)
+    target_dir.mkdir(parents=True, exist_ok=True)
+    save_path = _unique_dest_path(target_dir, clean_name)
+    shutil.move(str(temp_path), str(save_path))
+
+    if is_photo:
+        photo_item = scanner.parse_photo_file(
+            save_path, owner_id=owner_id, owner_name=owner_name, content_hash=clean_hash
+        )
+        if photo_item:
+            database.upsert_photo(photo_item)
+        else:
+            scanner.scan_library()
+        return {
+            "status": "ok",
+            "deduplicated": False,
+            "photo_id": photo_item["id"] if photo_item else None,
+            "filename": save_path.name,
+            "owner_name": owner_name,
+            "message": f"Successfully backed up '{save_path.name}'.",
+        }
+
+    media_item = scanner.parse_media_file(save_path, owner_id=owner_id, owner_name=owner_name)
+    if media_item:
+        database.upsert_song(media_item)
+        if playlist_id:
+            try:
+                database.add_song_to_playlist(playlist_id, media_item["id"])
+            except Exception:
+                pass
+    else:
+        scanner.scan_library()
+    return {
+        "status": "ok",
+        "deduplicated": False,
+        "media_id": media_item["id"] if media_item else None,
+        "filename": save_path.name,
+        "owner_name": owner_name,
+        "message": f"Successfully shared '{save_path.name}' with everyone!",
+    }
+
+
 @app.post("/api/upload")
 async def upload_media_file(
     request: Request,
@@ -847,70 +994,259 @@ async def upload_media_file(
 ):
     if not file.filename:
         raise HTTPException(status_code=400, detail="No file selected")
-    
+
+    clean_name = _sanitize_upload_filename(file.filename)
     cid = get_request_client_id(request, client_id)
     dname = device_name or ("Host" if cid == "host" else f"Peer ({cid[:6]})")
-    suffix = pathlib.Path(file.filename).suffix.lower()
-    is_photo = suffix in config.PHOTO_EXTENSIONS
-    media_type = "photo" if is_photo else ("video" if suffix in config.VIDEO_EXTENSIONS else "audio")
-    
-    # Check if Host Approval Queue is active and client is not host
-    if settings.is_upload_approval_required() and not is_host_admin(request):
-        upload_id = str(uuid.uuid4())
-        staging_dir = config.STAGING_DIR
-        staging_dir.mkdir(parents=True, exist_ok=True)
-        staging_path = staging_dir / f"{upload_id}_{file.filename}"
-        filesize = 0
-        with open(staging_path, "wb") as buffer:
+    media_type = _detect_media_type(clean_name)
+    approval_required = settings.is_upload_approval_required() and not is_host_admin(request)
+
+    config.STAGING_DIR.mkdir(parents=True, exist_ok=True)
+    temp_path = config.STAGING_DIR / f"tmp_{uuid.uuid4().hex}_{clean_name}"
+    digest = hashlib.sha256()
+    try:
+        with open(temp_path, "wb") as buffer:
             while chunk := await file.read(1024 * 1024):
-                filesize += len(chunk)
+                digest.update(chunk)
                 buffer.write(chunk)
-        database.add_pending_upload(
-            upload_id=upload_id,
-            filename=file.filename,
-            staging_path=str(staging_path.resolve()),
-            filesize=filesize,
+        return _finalize_uploaded_file(
+            temp_path=temp_path,
+            filename=clean_name,
             media_type=media_type,
             owner_id=cid,
             owner_name=dname,
-            target_folder=str(config.DEFAULT_PHOTO_DIR if is_photo else config.DEFAULT_MUSIC_DIR)
+            approval_required=approval_required,
+            content_hash=digest.hexdigest() if media_type == "photo" else None,
+            playlist_id=playlist_id,
         )
+    except Exception:
+        temp_path.unlink(missing_ok=True)
+        raise
+
+
+@app.post("/api/upload/photos/check")
+@app.post("/api/upload/check")
+def check_existing_upload_hashes(body: UploadHashCheckRequest):
+    clean_hashes = []
+    seen = set()
+    for raw in body.hashes:
+        h = (raw or "").strip().lower()
+        if h and h not in seen:
+            seen.add(h)
+            clean_hashes.append(h)
+    existing_map = database.get_existing_photo_hashes(clean_hashes)
+    existing = [h for h in clean_hashes if h in existing_map]
+    missing = [h for h in clean_hashes if h not in existing_map]
+    return {"existing": existing, "existing_map": existing_map, "missing": missing}
+
+
+@app.post("/api/upload/chunked/init")
+def init_chunked_upload(body: ChunkedUploadInitRequest, request: Request):
+    clean_name = _sanitize_upload_filename(body.filename)
+    if body.total_size < 0:
+        raise HTTPException(status_code=400, detail="total_size must be non-negative")
+    cid = get_request_client_id(request, body.client_id)
+    dname = body.device_name or ("Host" if cid == "host" else f"Peer ({cid[:6]})")
+    media_type = _detect_media_type(clean_name, body.media_type)
+    clean_hash = body.content_hash.strip().lower() if body.content_hash else None
+    chunk_size = max(256 * 1024, min(int(body.chunk_size or (8 * 1024 * 1024)), 32 * 1024 * 1024))
+
+    if media_type == "photo" and clean_hash:
+        existing_photo = database.get_photo_by_hash(clean_hash)
+        if existing_photo:
+            return {
+                "status": "duplicate",
+                "deduplicated": True,
+                "photo_id": existing_photo["id"],
+                "filename": clean_name,
+            }
+        existing_pending = database.has_pending_upload_hash(clean_hash)
+        if existing_pending:
+            return {
+                "status": "duplicate",
+                "deduplicated": True,
+                "upload_id": existing_pending["id"],
+                "filename": clean_name,
+            }
+
+    resumable = database.find_resumable_upload_session(cid, clean_hash, clean_name, body.total_size)
+    if resumable:
+        part_path = pathlib.Path(resumable["staging_path"])
+        actual_bytes = part_path.stat().st_size if part_path.exists() else 0
+        if actual_bytes != resumable["received_bytes"]:
+            database.update_upload_session_progress(resumable["id"], actual_bytes)
         return {
-            "status": "pending",
-            "upload_id": upload_id,
-            "filename": file.filename,
-            "message": f"'{file.filename}' sent to host approval queue.",
-            "owner_name": dname
+            "status": "resumed",
+            "deduplicated": False,
+            "upload_id": resumable["id"],
+            "chunk_size": resumable["chunk_size"],
+            "received_bytes": actual_bytes,
+            "next_offset": actual_bytes,
+            "total_size": resumable["total_size"],
         }
 
-    target_dir = settings.get_target_upload_folder(media_type)
-    target_dir.mkdir(parents=True, exist_ok=True)
-    
-    save_path = target_dir / file.filename
-    with open(save_path, "wb") as buffer:
-        while chunk := await file.read(1024 * 1024):
-            buffer.write(chunk)
-            
-    # Parse and upsert with owner info
-    if is_photo:
-        photo_item = scanner.parse_photo_file(save_path, owner_id=cid, owner_name=dname)
-        if photo_item:
-            database.upsert_photo(photo_item)
-        else:
-            scanner.scan_library()
-    else:
-        media_item = scanner.parse_media_file(save_path, owner_id=cid, owner_name=dname)
-        if media_item:
-            database.upsert_song(media_item)
-            if playlist_id:
-                try:
-                    database.add_song_to_playlist(playlist_id, media_item["id"])
-                except Exception:
-                    pass
-        else:
-            scanner.scan_library()
+    upload_id = str(uuid.uuid4())
+    chunks_dir = config.STAGING_DIR / "chunks"
+    chunks_dir.mkdir(parents=True, exist_ok=True)
+    part_path = chunks_dir / f"{upload_id}.part"
+    part_path.touch()
+    session = database.create_upload_session(
+        upload_id=upload_id,
+        filename=clean_name,
+        media_type=media_type,
+        total_size=body.total_size,
+        chunk_size=chunk_size,
+        staging_path=str(part_path.resolve()),
+        content_hash=clean_hash,
+        owner_id=cid,
+        owner_name=dname,
+        playlist_id=body.playlist_id,
+    )
+    return {
+        "status": "created",
+        "deduplicated": False,
+        "upload_id": session["id"],
+        "chunk_size": session["chunk_size"],
+        "received_bytes": 0,
+        "next_offset": 0,
+        "total_size": session["total_size"],
+    }
 
-    return {"status": "ok", "message": f"Successfully shared '{file.filename}' with everyone!", "filename": file.filename, "owner_name": dname}
+
+@app.get("/api/upload/chunked/{upload_id}/status")
+def get_chunked_upload_status(upload_id: str):
+    session = database.get_upload_session(upload_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Upload session not found")
+    part_path = pathlib.Path(session["staging_path"])
+    actual_bytes = part_path.stat().st_size if part_path.exists() else session["received_bytes"]
+    return {
+        "upload_id": session["id"],
+        "filename": session["filename"],
+        "status": session["status"],
+        "total_size": session["total_size"],
+        "chunk_size": session["chunk_size"],
+        "received_bytes": actual_bytes,
+        "next_offset": actual_bytes,
+    }
+
+
+@app.put("/api/upload/chunked/{upload_id}")
+@app.post("/api/upload/chunked/{upload_id}")
+async def upload_chunked_part(
+    upload_id: str,
+    request: Request,
+    offset: Optional[int] = Query(None, ge=0),
+    chunk: Optional[UploadFile] = File(None),
+):
+    session = database.get_upload_session(upload_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Upload session not found")
+    if session["status"] != "uploading":
+        raise HTTPException(status_code=409, detail=f"Upload session is '{session['status']}'")
+
+    if offset is None:
+        content_range = request.headers.get("content-range", "")
+        match = re.match(r"bytes\s+(\d+)-(\d+)/(\d+|\*)", content_range.strip(), re.IGNORECASE)
+        if match:
+            offset = int(match.group(1))
+        else:
+            offset = 0
+
+    part_path = pathlib.Path(session["staging_path"])
+    part_path.parent.mkdir(parents=True, exist_ok=True)
+    current_size = part_path.stat().st_size if part_path.exists() else 0
+
+    if chunk is not None:
+        data = await chunk.read()
+    else:
+        data = await request.body()
+
+    if offset > current_size:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Chunk offset {offset} ahead of received {current_size}. Resume at {current_size}.",
+            headers={"X-Expected-Offset": str(current_size)},
+        )
+
+    if offset + len(data) > session["total_size"]:
+        raise HTTPException(status_code=400, detail="Chunk exceeds declared total_size")
+
+    # Idempotent replay if a client retries a previously acknowledged chunk
+    if offset + len(data) <= current_size:
+        return {
+            "upload_id": upload_id,
+            "received_bytes": current_size,
+            "next_offset": current_size,
+            "complete": current_size >= session["total_size"],
+        }
+
+    # Write only the non-overlapping tail if partial overlap occurred on retry
+    skip = current_size - offset
+    with open(part_path, "ab") as f:
+        f.write(data[skip:])
+
+    new_size = part_path.stat().st_size
+    database.update_upload_session_progress(upload_id, new_size)
+    return {
+        "upload_id": upload_id,
+        "received_bytes": new_size,
+        "next_offset": new_size,
+        "complete": new_size >= session["total_size"],
+    }
+
+
+@app.post("/api/upload/chunked/{upload_id}/complete")
+def complete_chunked_upload(upload_id: str, request: Request):
+    session = database.get_upload_session(upload_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Upload session not found")
+    part_path = pathlib.Path(session["staging_path"])
+    if not part_path.exists():
+        database.delete_upload_session(upload_id)
+        raise HTTPException(status_code=404, detail="Upload part file missing")
+
+    actual_size = part_path.stat().st_size
+    if actual_size != session["total_size"]:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Incomplete upload: received {actual_size} of {session['total_size']} bytes.",
+        )
+
+    computed_hash = scanner.compute_file_sha256(part_path)
+    declared_hash = (session.get("content_hash") or "").strip().lower()
+    if declared_hash and computed_hash != declared_hash:
+        part_path.unlink(missing_ok=True)
+        database.delete_upload_session(upload_id)
+        raise HTTPException(status_code=422, detail="File SHA-256 checksum mismatch after upload.")
+
+    approval_required = settings.is_upload_approval_required() and not is_host_admin(request)
+    result = _finalize_uploaded_file(
+        temp_path=part_path,
+        filename=session["filename"],
+        media_type=session["media_type"],
+        owner_id=session["owner_id"],
+        owner_name=session["owner_name"],
+        approval_required=approval_required,
+        content_hash=declared_hash or computed_hash,
+        playlist_id=session.get("playlist_id"),
+    )
+    database.delete_upload_session(upload_id)
+    if result.get("status") == "ok" and session["media_type"] == "photo":
+        threading.Thread(target=scanner.scan_library, daemon=True).start()
+    return result
+
+
+@app.delete("/api/upload/chunked/{upload_id}")
+def abort_chunked_upload(upload_id: str):
+    session = database.get_upload_session(upload_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Upload session not found")
+    part_path = pathlib.Path(session["staging_path"])
+    part_path.unlink(missing_ok=True)
+    database.delete_upload_session(upload_id)
+    return {"status": "aborted", "upload_id": upload_id}
+
 
 @app.post("/api/upload/photos")
 async def upload_photos_batch(
@@ -922,55 +1258,59 @@ async def upload_photos_batch(
     cid = get_request_client_id(request, client_id)
     dname = device_name or ("Host" if cid == "host" else f"Peer ({cid[:6]})")
     approval_required = settings.is_upload_approval_required() and not is_host_admin(request)
-    
-    target_dir = config.DEFAULT_PHOTO_DIR
-    target_dir.mkdir(parents=True, exist_ok=True)
-    staging_dir = config.STAGING_DIR
-    staging_dir.mkdir(parents=True, exist_ok=True)
-    
+
+    config.STAGING_DIR.mkdir(parents=True, exist_ok=True)
+
     saved_count = 0
     pending_count = 0
-    
+    skipped_count = 0
+    deduplicated_hashes: List[str] = []
+
     for f in files:
         if not f.filename:
             continue
-        if approval_required:
-            upload_id = str(uuid.uuid4())
-            staging_path = staging_dir / f"{upload_id}_{f.filename}"
-            filesize = 0
-            with open(staging_path, "wb") as buffer:
+        clean_name = _sanitize_upload_filename(f.filename)
+        temp_path = config.STAGING_DIR / f"tmp_{uuid.uuid4().hex}_{clean_name}"
+        digest = hashlib.sha256()
+        try:
+            with open(temp_path, "wb") as buffer:
                 while chunk := await f.read(1024 * 1024):
-                    filesize += len(chunk)
+                    digest.update(chunk)
                     buffer.write(chunk)
-            database.add_pending_upload(
-                upload_id=upload_id,
-                filename=f.filename,
-                staging_path=str(staging_path.resolve()),
-                filesize=filesize,
+            file_hash = digest.hexdigest()
+            res = _finalize_uploaded_file(
+                temp_path=temp_path,
+                filename=clean_name,
                 media_type="photo",
                 owner_id=cid,
                 owner_name=dname,
-                target_folder=str(target_dir)
+                approval_required=approval_required,
+                content_hash=file_hash,
             )
-            pending_count += 1
-        else:
-            save_path = target_dir / f.filename
-            with open(save_path, "wb") as buffer:
-                while chunk := await f.read(1024 * 1024):
-                    buffer.write(chunk)
-            photo_item = scanner.parse_photo_file(save_path, owner_id=cid, owner_name=dname)
-            if photo_item:
-                database.upsert_photo(photo_item)
-            saved_count += 1
-            
+            if res["status"] == "duplicate":
+                skipped_count += 1
+                deduplicated_hashes.append(file_hash)
+            elif res["status"] == "pending":
+                pending_count += 1
+            else:
+                saved_count += 1
+        except Exception:
+            temp_path.unlink(missing_ok=True)
+            raise
+
     if saved_count > 0:
         threading.Thread(target=scanner.scan_library, daemon=True).start()
-        
+
     return {
         "status": "ok",
         "saved_count": saved_count,
         "pending_count": pending_count,
-        "message": f"Processed {len(files)} photos ({saved_count} added, {pending_count} pending approval)."
+        "skipped_count": skipped_count,
+        "deduplicated_hashes": deduplicated_hashes,
+        "message": (
+            f"Processed {len(files)} photos "
+            f"({saved_count} added, {skipped_count} duplicates skipped, {pending_count} pending approval)."
+        ),
     }
 
 # --- Host Approval Queue Endpoints ---
@@ -1008,7 +1348,12 @@ def approve_pending_upload(upload_id: str, request: Request):
     shutil.move(str(staging_file), str(dest_path))
     
     if is_photo:
-        photo_item = scanner.parse_photo_file(dest_path, owner_id=item["owner_id"], owner_name=item["owner_name"])
+        photo_item = scanner.parse_photo_file(
+            dest_path,
+            owner_id=item["owner_id"],
+            owner_name=item["owner_name"],
+            content_hash=item.get("content_hash"),
+        )
         if photo_item:
             database.upsert_photo(photo_item)
     else:
@@ -1751,6 +2096,52 @@ def compatible_playback_status(song_id: str):
     if not song:
         raise HTTPException(status_code=404, detail="Media not found")
     return streamer.compatibility_job(song["path"], song.get("media_type") == "video")
+
+
+@app.get("/api/hls/{song_id}/index.m3u8")
+def stream_hls_playlist(
+    song_id: str,
+    quality: str = Query("720p"),
+    t: Optional[str] = Query(None),
+):
+    song = database.get_song(song_id)
+    if not song:
+        raise HTTPException(status_code=404, detail="Media not found")
+    clean_quality = streamer.normalize_hls_quality(quality)
+    playlist_text, is_complete = streamer.get_hls_playlist(song["path"], quality=clean_quality)
+    query_parts = [f"quality={urllib.parse.quote(clean_quality)}"]
+    if t:
+        query_parts.append(f"t={urllib.parse.quote(t)}")
+    qs = "&".join(query_parts)
+    lines = []
+    for line in playlist_text.splitlines():
+        if line.strip().endswith(".ts"):
+            lines.append(f"{line.strip()}?{qs}")
+        else:
+            lines.append(line)
+    headers = {"Cache-Control": "public, max-age=3600" if is_complete else "no-cache"}
+    return Response(content="\n".join(lines) + "\n", media_type="application/vnd.apple.mpegurl", headers=headers)
+
+
+@app.get("/api/hls/{song_id}/status")
+def hls_stream_status(song_id: str, quality: str = Query("720p")):
+    song = database.get_song(song_id)
+    if not song:
+        raise HTTPException(status_code=404, detail="Media not found")
+    return streamer.get_hls_status(song["path"], quality=quality)
+
+
+@app.get("/api/hls/{song_id}/{segment_name}")
+def stream_hls_segment(song_id: str, segment_name: str, quality: str = Query("720p")):
+    song = database.get_song(song_id)
+    if not song:
+        raise HTTPException(status_code=404, detail="Media not found")
+    seg_path = streamer.get_hls_segment_path(song["path"], segment_name, quality=quality)
+    return FileResponse(
+        str(seg_path),
+        media_type="video/mp2t",
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
 
 @app.get("/api/cover/{song_id}")
 def get_cover_art(song_id: str):
